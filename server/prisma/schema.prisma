@@ -1,0 +1,461 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ═══════════════════════════════════════
+// USERS & AUTH
+// ═══════════════════════════════════════
+
+model Users {
+  userId       String   @id @default(uuid())
+  name         String
+  username     String   @unique
+  email        String   @unique
+  password     String
+  role         String   @default("admin_toko")
+  language     String   @default("English")
+  notification Boolean  @default(true)
+  profileImage String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @default(now()) @updatedAt
+
+  // Purchase Order (pembelian ke supplier)
+  PurchaseOrdersCreated   PurchaseOrder[] @relation("POCreatedBy")
+  PurchaseOrdersValidated PurchaseOrder[] @relation("POValidatedBy")
+
+  // Store Replenishment (pengisian toko dari gudang)
+  StoreReplenishmentsCreated  StoreReplenishment[] @relation("SRCreatedBy")
+  StoreReplenishmentsApproved StoreReplenishment[] @relation("SRApprovedBy")
+  StoreReplenishmentsShipped  StoreReplenishment[] @relation("SRShippedBy")
+  StoreReplenishmentsReceived StoreReplenishment[] @relation("SRReceivedBy")
+
+  Transactions   Transaction[]
+  Notifications  Notification[]
+  StockMovements StockMovement[]
+
+  // Pengeluaran operasional (dicatat Super Admin)
+  ExpensesCreated OperationalExpense[] @relation("ExpenseCreatedBy")
+  ExpensesUpdated OperationalExpense[] @relation("ExpenseUpdatedBy")
+
+  // Konfirmasi / pembatalan pembayaran QRIS & pengaturan toko
+  TransactionsConfirmed Transaction[]   @relation("TrxConfirmedBy")
+  TransactionsCancelled Transaction[]   @relation("TrxCancelledBy")
+  StoreSettingsUpdated  StoreSettings[] @relation("StoreSettingsUpdatedBy")
+}
+
+// ═══════════════════════════════════════
+// PRODUCTS & VARIANTS
+// ═══════════════════════════════════════
+
+model Products {
+  productId   String   @id @default(uuid())
+  name        String
+  description String?
+  category    String?
+  price       Float
+  rating      Float?
+  ratingCount Int      @default(0)
+  imageUrl    String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+  stockGudang Int      @default(0)
+  stockToko   Int      @default(0)
+
+  Variants                ProductVariant[]
+  PurchaseOrderItems      PurchaseOrderItem[]
+  StoreReplenishmentItems StoreReplenishmentItem[]
+  TransactionItems        TransactionItem[]
+  StockMovements          StockMovement[]
+  Sales                   Sales[]
+  Purchases               Purchases[]
+  Discounts               Discounts[]
+}
+
+model ProductVariant {
+  variantId   String   @id @default(uuid())
+  productId   String
+  name        String // nama varian yang ditampilkan, contoh: "Safa Ather"
+  type        String // "Ukuran" (default) | "warna" | "jenis"
+  value       String // ukuran/nilai varian, "-" jika tidak ada
+  stockGudang Int      @default(0)
+  stockToko   Int      @default(0)
+  price       Float? // harga varian
+  imageUrl    String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  product                 Products                 @relation(fields: [productId], references: [productId])
+  PurchaseOrderItems      PurchaseOrderItem[]
+  StoreReplenishmentItems StoreReplenishmentItem[]
+  TransactionItems        TransactionItem[]
+}
+
+// ═══════════════════════════════════════
+// PURCHASE ORDER (pembelian ke SUPPLIER)
+// Dibuat Super Admin → barang diterima & divalidasi Admin Gudang
+// ═══════════════════════════════════════
+
+model PurchaseOrder {
+  poId     String @id @default(uuid())
+  poNumber String @unique // Auto: PO-YYYYMMDD-XXX
+  status   String @default("pending")
+  // "pending" → "received"
+
+  // ── Bukti pembelian (wajib saat dibuat Super Admin) ──
+  supplier       String
+  invoiceNumber  String // nomor nota / invoice supplier
+  trackingNumber String // nomor resi / pengiriman
+  invoiceDate    DateTime
+  invoiceTotal   Float // total yang tertera di nota
+  invoiceImage   String // foto / scan nota (data URL)
+
+  // ── Bukti penerimaan (diisi Admin Gudang saat validasi) ──
+  deliveryNoteNumber String? // nomor surat jalan penerimaan
+  receiptImage       String? // foto bukti barang diterima (data URL)
+  receiveNotes       String? // catatan / alasan selisih
+
+  notes String?
+
+  createdById   String
+  validatedById String?
+
+  createdAt  DateTime  @default(now())
+  receivedAt DateTime?
+
+  createdBy   Users               @relation("POCreatedBy", fields: [createdById], references: [userId])
+  validatedBy Users?              @relation("POValidatedBy", fields: [validatedById], references: [userId])
+  Items       PurchaseOrderItem[]
+}
+
+model PurchaseOrderItem {
+  poItemId  String  @id @default(uuid())
+  poId      String
+  productId String
+  variantId String?
+
+  qtyOrdered  Int
+  qtyReceived Int? // qty aktual yang diterima saat validasi
+  unitCost    Float
+  subtotal    Float
+  receiveNote String? // alasan jika qtyReceived ≠ qtyOrdered
+
+  purchaseOrder PurchaseOrder   @relation(fields: [poId], references: [poId])
+  product       Products        @relation(fields: [productId], references: [productId])
+  variant       ProductVariant? @relation(fields: [variantId], references: [variantId])
+}
+
+// ═══════════════════════════════════════
+// STORE REPLENISHMENT (pengisian toko dari GUDANG)
+// Super Admin buat → Admin Gudang setujui & kirim → Admin Toko konfirmasi terima
+// ═══════════════════════════════════════
+
+model StoreReplenishment {
+  srId     String @id @default(uuid())
+  srNumber String @unique // Auto: SR-YYYYMMDD-XXX
+  status   String @default("pending")
+  // "pending" → "approved" → "shipped" → "completed"
+  // "pending" → "rejected"
+
+  notes          String?
+  rejectedReason String?
+
+  // ── Bukti pengiriman (diisi Admin Gudang saat validasi pengiriman) ──
+  deliveryNoteNumber String? // nomor surat jalan
+  courierName        String? // nama pengantar
+  deliveryNoteImage  String? // foto surat jalan (data URL)
+  shipNotes          String? // catatan / alasan jika kirim kurang
+
+  // ── Bukti penerimaan (diisi Admin Toko saat konfirmasi) ──
+  receiveImage String? // foto barang diterima (data URL)
+  receiveNotes String? // catatan / alasan selisih
+
+  createdById  String
+  approvedById String?
+  shippedById  String?
+  receivedById String?
+
+  createdAt  DateTime  @default(now())
+  approvedAt DateTime?
+  shippedAt  DateTime?
+  receivedAt DateTime?
+
+  createdBy  Users                    @relation("SRCreatedBy", fields: [createdById], references: [userId])
+  approvedBy Users?                   @relation("SRApprovedBy", fields: [approvedById], references: [userId])
+  shippedBy  Users?                   @relation("SRShippedBy", fields: [shippedById], references: [userId])
+  receivedBy Users?                   @relation("SRReceivedBy", fields: [receivedById], references: [userId])
+  Items      StoreReplenishmentItem[]
+}
+
+model StoreReplenishmentItem {
+  srItemId  String  @id @default(uuid())
+  srId      String
+  productId String
+  variantId String?
+
+  qtyRequested Int
+  qtyApproved  Int?
+  qtyShipped   Int? // dikirim gudang (stok gudang berkurang)
+  qtyReceived  Int? // diterima toko (stok toko bertambah)
+
+  unitCost Float
+  subtotal Float
+
+  shipNote    String? // alasan jika qtyShipped < qtyApproved
+  receiveNote String? // alasan jika qtyReceived < qtyShipped
+
+  storeReplenishment StoreReplenishment @relation(fields: [srId], references: [srId])
+  product            Products           @relation(fields: [productId], references: [productId])
+  variant            ProductVariant?    @relation(fields: [variantId], references: [variantId])
+}
+
+// ═══════════════════════════════════════
+// TRANSAKSI PENJUALAN (Admin Toko)
+// ═══════════════════════════════════════
+
+model Transaction {
+  transactionId     String @id @default(uuid())
+  transactionNumber String @unique // Auto: TRX-YYYYMMDD-XXX
+
+  cashierId     String // Admin toko yang input
+  customerName  String?
+  paymentMethod String // "cash" | "transfer" | "qris"
+  paymentAmount Float // Uang yang dibayar
+  totalAmount   Float
+  changeAmount  Float   @default(0) // Kembalian
+  notes         String?
+
+  // Status pembayaran:
+  //   "paid"            → lunas, stok sudah dikurangi (tunai/transfer langsung paid)
+  //   "pending_payment" → QRIS menunggu konfirmasi kasir, stok BELUM dikurangi
+  //   "cancelled"       → QRIS dibatalkan, stok tidak berubah
+  status        String    @default("paid")
+  qrisPayload   String? // QRIS dinamis (nominal terisi) untuk ditampilkan ulang
+  paidAt        DateTime?
+  confirmedById String?
+  cancelledAt   DateTime?
+  cancelledById String?
+  cancelReason  String?
+
+  createdAt DateTime @default(now())
+
+  cashier     Users             @relation(fields: [cashierId], references: [userId])
+  confirmedBy Users?            @relation("TrxConfirmedBy", fields: [confirmedById], references: [userId])
+  cancelledBy Users?            @relation("TrxCancelledBy", fields: [cancelledById], references: [userId])
+  Items       TransactionItem[]
+
+  @@index([status])
+}
+
+// ═══════════════════════════════════════
+// PENGATURAN TOKO (satu baris, id = "default")
+// QRIS statis toko dipakai untuk membuat QRIS dinamis per transaksi.
+// ═══════════════════════════════════════
+
+model StoreSettings {
+  id           String   @id @default("default")
+  storeName    String   @default("Nona Aksesoris")
+  storeAddress String   @default("Jl. Madukara, Jeruklegi, Cilacap")
+  qrisPayload  String? // QRIS statis toko (teks EMV, diawali 000201)
+  qrisMerchant String? // nama merchant dari QRIS (tag 59), untuk ditampilkan
+  qrisCity     String? // kota merchant (tag 60)
+  updatedById  String?
+  updatedAt    DateTime @default(now()) @updatedAt
+
+  updatedBy Users? @relation("StoreSettingsUpdatedBy", fields: [updatedById], references: [userId])
+}
+
+model TransactionItem {
+  itemId        String  @id @default(uuid())
+  transactionId String
+  productId     String
+  variantId     String?
+
+  productName String // Snapshot nama produk saat transaksi
+  variantName String? // Snapshot nama varian
+  qty         Int
+  unitPrice   Float
+  subtotal    Float
+
+  transaction Transaction     @relation(fields: [transactionId], references: [transactionId])
+  product     Products        @relation(fields: [productId], references: [productId])
+  variant     ProductVariant? @relation(fields: [variantId], references: [variantId])
+}
+
+// ═══════════════════════════════════════
+// STOCK MOVEMENT (Log Pergerakan Stok)
+// type: restock_gudang | po_transfer | sale | adjustment | ...
+// referenceType: "PURCHASE_ORDER" | "STORE_REPLENISHMENT" | "TRANSACTION"
+// (nilai lama "PO" / "RESTOCK" hanya ada di data uji sebelum penggantian nama)
+// ═══════════════════════════════════════
+
+model StockMovement {
+  id            String   @id @default(uuid())
+  productId     String
+  variantId     String?
+  userId        String?
+  location      String   @default("toko")
+  type          String
+  quantity      Int
+  stockBefore   Int      @default(0)
+  stockAfter    Int      @default(0)
+  referenceId   String?
+  referenceType String?
+  notes         String?
+  createdAt     DateTime @default(now())
+
+  product Products @relation(fields: [productId], references: [productId])
+  user    Users?   @relation(fields: [userId], references: [userId])
+}
+
+// ═══════════════════════════════════════
+// NOTIFICATIONS
+// ═══════════════════════════════════════
+
+model Notification {
+  notifId String @id @default(uuid())
+  userId  String // Penerima notifikasi
+  title   String
+  message String
+  type    String
+  // Purchase Order (supplier):
+  //   "po_created"   → ke admin gudang (barang akan datang)
+  //   "po_received"  → ke super admin (penerimaan divalidasi)
+  // Store Replenishment:
+  //   "sr_created"   → ke admin gudang (menunggu persetujuan)
+  //   "sr_approved"  → ke super admin
+  //   "sr_rejected"  → ke super admin
+  //   "sr_shipped"   → ke admin toko (menunggu konfirmasi) & super admin
+  //   "sr_received"  → ke super admin & admin gudang
+  //   "sr_discrepancy" → ke super admin (jumlah diterima ≠ dikirim)
+
+  isRead        Boolean  @default(false)
+  referenceId   String? // poId / srId (acuan umum, tanpa foreign key)
+  referenceType String? // "PURCHASE_ORDER" | "STORE_REPLENISHMENT"
+  createdAt     DateTime @default(now())
+
+  user Users @relation(fields: [userId], references: [userId])
+}
+
+// ═══════════════════════════════════════
+// PENGELUARAN OPERASIONAL (Super Admin)
+// Pembelian stok TIDAK dicatat di sini; diambil dari PurchaseOrder.
+// Hapus = soft delete (isActive=false) agar jejak audit tetap ada.
+// ═══════════════════════════════════════
+
+model OperationalExpense {
+  expenseId     String   @id @default(uuid())
+  expenseNumber String   @unique // Auto: EXP-YYYYMMDD-XXX
+  category      String // Gaji | Sewa | Listrik & Air | Internet & Telepon | Transportasi | Perlengkapan | Perawatan | Lainnya
+  description   String
+  amount        Float
+  expenseDate   DateTime // tanggal pengeluaran terjadi
+  paymentMethod String   @default("cash") // cash | transfer | qris
+  receiptImage  String? // foto struk / nota (opsional, data URL)
+  notes         String?
+  isActive      Boolean  @default(true)
+
+  createdById String
+  updatedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  createdBy Users  @relation("ExpenseCreatedBy", fields: [createdById], references: [userId])
+  updatedBy Users? @relation("ExpenseUpdatedBy", fields: [updatedById], references: [userId])
+
+  @@index([expenseDate])
+}
+
+// ═══════════════════════════════════════
+// LEGACY TABLES (dipertahankan)
+// ═══════════════════════════════════════
+
+model Sales {
+  saleId      String   @id
+  productId   String
+  timestamp   DateTime
+  quantity    Int
+  unitPrice   Float
+  totalAmount Float
+  product     Products @relation(fields: [productId], references: [productId])
+}
+
+model Purchases {
+  purchaseId String   @id
+  productId  String
+  timestamp  DateTime
+  quantity   Int
+  unitCost   Float
+  totalCost  Float
+  product    Products @relation(fields: [productId], references: [productId])
+}
+
+model Expenses {
+  expenseId String   @id
+  category  String
+  amount    Float
+  timestamp DateTime
+}
+
+model SalesSummary {
+  salesSummaryId   String   @id
+  totalValue       Float
+  changePercentage Float?
+  date             DateTime
+}
+
+model PurchaseSummary {
+  purchaseSummaryId String   @id
+  totalPurchased    Float
+  changePercentage  Float?
+  date              DateTime
+}
+
+model ExpenseSummary {
+  expenseSummaryId  String              @id
+  totalExpenses     Float
+  date              DateTime
+  ExpenseByCategory ExpenseByCategory[]
+}
+
+model ExpenseByCategory {
+  expenseByCategoryId String         @id
+  expenseSummaryId    String
+  category            String
+  amount              BigInt
+  date                DateTime
+  expenseSummary      ExpenseSummary @relation(fields: [expenseSummaryId], references: [expenseSummaryId])
+}
+
+model Discounts {
+  discountId      String   @id
+  productId       String
+  discountPercent Float
+  amount          Float
+  timestamp       DateTime
+  product         Products @relation(fields: [productId], references: [productId])
+}
+
+model Orders {
+  orderId     String   @id
+  productId   String
+  userId      String
+  quantity    Int
+  totalAmount Float
+  status      String   @default("pending")
+  timestamp   DateTime
+}
+
+model Invoices {
+  invoiceId String   @id
+  userId    String
+  amount    Float
+  status    String   @default("unpaid")
+  dueDate   DateTime
+  createdAt DateTime
+}

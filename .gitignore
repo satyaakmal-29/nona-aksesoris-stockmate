@@ -1,0 +1,32 @@
+# ── Rahasia & konfigurasi lokal (JANGAN di-push) ──────────────────
+.env
+.env.*
+!.env.example
+
+# Catatan proyek untuk Claude (lokal saja, keputusan pemilik proyek)
+CLAUDE.md
+.claude/
+
+# ── Dependensi & hasil build ──────────────────────────────────────
+node_modules/
+client/.next/
+client/out/
+client/build/
+client/next-env.d.ts
+server/dist/
+server/generated/
+*.tsbuildinfo
+coverage/
+
+# ── Log & berkas sistem ───────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor ────────────────────────────────────────────────────────
+.vscode/
+.idea/
