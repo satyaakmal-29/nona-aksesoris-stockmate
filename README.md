@@ -2,8 +2,6 @@
 
 Aplikasi manajemen stok untuk toko **Nona Aksesoris**: stok gudang dan toko per varian produk, pembelian ke supplier (Purchase Order), pengisian stok toko dari gudang (Store Replenishment), transaksi penjualan dengan tunai, transfer, atau QRIS dinamis, pengeluaran, laporan (CSV/Excel/PDF), dan notifikasi stok menipis.
 
-Proyek Capstone/UAS — Teknik Informatika, Universitas Muhammadiyah Surakarta.
-
 ## Struktur
 
 ```
