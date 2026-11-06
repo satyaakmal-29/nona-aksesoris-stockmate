@@ -8,6 +8,7 @@ import {
   updateUser,
   resetUserPassword,
   deleteUser,
+  getWaContacts,
 } from "../controllers/userController";
 import { requireAuth, isSuperAdmin } from "../middleware/auth";
 
@@ -21,6 +22,9 @@ router.use(requireAuth);
 router.get("/profile",            getProfile);
 router.patch("/profile/password", changeOwnPassword);
 router.put("/profile/:userId",    updateProfile);
+
+// Kontak WhatsApp untuk tombol "Kirim via WA" (PO & Store Replenishment) — semua peran
+router.get("/wa-contacts",        getWaContacts);
 
 // Manajemen user — hanya super_admin
 router.get("/",                   isSuperAdmin, getUsers);

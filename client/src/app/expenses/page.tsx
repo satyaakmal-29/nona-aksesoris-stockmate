@@ -4,7 +4,9 @@ import { useState } from "react";
 import Header from "@/app/(components)/Header";
 import ExportMenu from "@/app/(components)/ExportMenu";
 import ProofImageInput, { ProofImageView } from "@/app/(components)/ProofImageInput";
+import FieldError from "@/app/(components)/FieldError";
 import { useAppSelector } from "@/app/redux";
+import { EXPENSE_MAX, MAX_LEN, formatLimit, optionalTextError, requiredTextError, squeeze } from "@/lib/validation";
 import {
   EXPENSE_CATEGORIES,
   ExpenseCategory,
@@ -75,7 +77,8 @@ const PriceInput = ({ value, onChange, className }: { value: number; onChange: (
       value={value ? value.toLocaleString("id-ID") : ""}
       placeholder="0"
       onChange={(e) => {
-        const digits = e.target.value.replace(/\D/g, "");
+        // Maks 9 digit (Rp 100.000.000)
+        const digits = e.target.value.replace(/\D/g, "").slice(0, 9);
         onChange(digits ? Number(digits) : 0);
       }}
       className={`${className} pl-9`}
@@ -197,6 +200,7 @@ const ExpensesPage = () => {
   const [newReceipt, setNewReceipt]   = useState<string | null>(null);
   const [removeReceipt, setRemoveReceipt] = useState(false);
   const [formError, setFormError]     = useState("");
+  const [showErrors, setShowErrors]   = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<OperationalExpense | null>(null);
   const [proofTarget, setProofTarget] = useState<string | null>(null);
   const [notice, setNotice]           = useState("");
@@ -216,6 +220,7 @@ const ExpensesPage = () => {
     setNewReceipt(null);
     setRemoveReceipt(false);
     setFormError("");
+    setShowErrors(false);
     setFormOpen(true);
   };
 
@@ -232,23 +237,34 @@ const ExpensesPage = () => {
     setNewReceipt(null);
     setRemoveReceipt(false);
     setFormError("");
+    setShowErrors(false);
     setFormOpen(true);
   };
 
+  // Error per kolom tampil setelah tombol simpan ditekan, lalu diperbarui saat mengetik
+  const formErrors = {
+    expenseDate: !form.expenseDate ? "Tanggal wajib diisi"
+      : form.expenseDate > today ? "Tanggal tidak boleh di masa depan" : "",
+    description: requiredTextError(form.description, "Keterangan", 1, MAX_LEN.note),
+    amount: !(form.amount > 0) ? "Jumlah pengeluaran harus lebih dari 0"
+      : form.amount > EXPENSE_MAX ? `Maksimal Rp ${formatLimit(EXPENSE_MAX)} per entri` : "",
+    notes: optionalTextError(form.notes, "Catatan", MAX_LEN.note),
+  };
+  const shown = (msg: string) => (showErrors ? msg : "");
+  const errCss = (msg: string) => (msg ? "!border-red-400" : "");
+
   const handleSave = async () => {
     setFormError("");
-    if (!form.description.trim()) return setFormError("Keterangan wajib diisi");
-    if (!(form.amount > 0)) return setFormError("Jumlah pengeluaran harus lebih dari 0");
-    if (!form.expenseDate) return setFormError("Tanggal wajib diisi");
-    if (form.expenseDate > today) return setFormError("Tanggal tidak boleh di masa depan");
+    setShowErrors(true);
+    if (Object.values(formErrors).some(Boolean)) return;
 
     const payload: ExpenseInput = {
       category:      form.category,
-      description:   form.description.trim(),
+      description:   squeeze(form.description),
       amount:        form.amount,
       expenseDate:   form.expenseDate,
       paymentMethod: form.paymentMethod,
-      notes:         form.notes.trim() || undefined,
+      notes:         squeeze(form.notes) || undefined,
     };
 
     try {
@@ -548,7 +564,8 @@ const ExpensesPage = () => {
             <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label className={labelCss}>Tanggal<span className="ml-0.5 text-red-500">*</span></label>
-                <input type="date" value={form.expenseDate} max={today} onChange={(e) => setForm((f) => ({ ...f, expenseDate: e.target.value }))} className={inputCss} />
+                <input type="date" value={form.expenseDate} max={today} onChange={(e) => setForm((f) => ({ ...f, expenseDate: e.target.value }))} className={`${inputCss} ${errCss(shown(formErrors.expenseDate))}`} />
+                <FieldError message={shown(formErrors.expenseDate)} />
               </div>
               <div>
                 <label className={labelCss}>Kategori<span className="ml-0.5 text-red-500">*</span></label>
@@ -558,20 +575,24 @@ const ExpensesPage = () => {
               </div>
             </div>
 
-            <label className={labelCss}>Keterangan<span className="ml-0.5 text-red-500">*</span></label>
-            <input
-              type="text"
-              value={form.description}
-              maxLength={200}
-              onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
-              placeholder="contoh: Token listrik Oktober"
-              className={`${inputCss} mb-3`}
-            />
+            <div className="mb-3">
+              <label className={labelCss}>Keterangan<span className="ml-0.5 text-red-500">*</span></label>
+              <input
+                type="text"
+                value={form.description}
+                maxLength={MAX_LEN.note}
+                onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+                placeholder="contoh: Token listrik Oktober"
+                className={`${inputCss} ${errCss(shown(formErrors.description))}`}
+              />
+              <FieldError message={shown(formErrors.description)} />
+            </div>
 
             <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label className={labelCss}>Jumlah<span className="ml-0.5 text-red-500">*</span></label>
-                <PriceInput value={form.amount} onChange={(n) => setForm((f) => ({ ...f, amount: n }))} className={inputCss} />
+                <PriceInput value={form.amount} onChange={(n) => setForm((f) => ({ ...f, amount: n }))} className={`${inputCss} ${errCss(shown(formErrors.amount))}`} />
+                <FieldError message={shown(formErrors.amount)} />
               </div>
               <div>
                 <label className={labelCss}>Metode Bayar</label>
@@ -600,8 +621,11 @@ const ExpensesPage = () => {
               hint="Struk, nota, atau bukti transfer."
             />
 
-            <label className={labelCss}>Catatan (opsional)</label>
-            <textarea value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} rows={2} className={`${inputCss} mb-4 resize-none`} />
+            <div className="mb-4">
+              <label className={labelCss}>Catatan (opsional)</label>
+              <textarea maxLength={MAX_LEN.note} value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} rows={2} className={`${inputCss} resize-none ${errCss(shown(formErrors.notes))}`} />
+              <FieldError message={shown(formErrors.notes)} />
+            </div>
 
             <div className="flex justify-end gap-2">
               <button onClick={() => setFormOpen(false)} className={btnSecondary}>Batal</button>

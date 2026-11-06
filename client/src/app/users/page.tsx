@@ -2,8 +2,22 @@
 
 import { useState } from "react";
 import Header from "@/app/(components)/Header";
+import FieldError from "@/app/(components)/FieldError";
 import { useAppSelector } from "@/app/redux";
 import { getTranslation } from "@/lib/translations";
+import {
+  MAX_LEN,
+  MAX_PASSWORD,
+  PASSWORD_HINT,
+  confirmPasswordError,
+  gmailError,
+  passwordError,
+  personNameError,
+  squeeze,
+  usernameError,
+  whatsappError,
+} from "@/lib/validation";
+import { formatWhatsapp } from "@/lib/whatsapp";
 import {
   useGetUsersQuery,
   useCreateUserMutation,
@@ -12,8 +26,9 @@ import {
   useResetUserPasswordMutation,
   User,
 } from "@/state/api";
-import { DataGrid, GridColDef } from "@mui/x-data-grid";
 import {
+  ArrowDownIcon,
+  ArrowUpIcon,
   KeyRoundIcon,
   PencilIcon,
   PlusCircleIcon,
@@ -23,13 +38,13 @@ import {
   ShieldAlertIcon,
 } from "lucide-react";
 
-const MIN_PASSWORD = 6;
-
 type UserFormData = {
   name:     string;
   username: string;
   email:    string;
+  whatsapp: string;
   password: string;
+  confirm:  string;
   role:     string;
   isActive: boolean;
 };
@@ -55,6 +70,24 @@ const getErrorMessage = (err: unknown, fallback: string) => {
   return e?.data?.message ?? fallback;
 };
 
+// Kolom yang bisa diurutkan (klik judul: naik → turun → urutan asli)
+type SortKey = "name" | "username" | "email" | "role" | "isActive";
+type SortState = { key: SortKey; dir: "asc" | "desc" } | null;
+
+const SORT_COLUMNS: { key: SortKey; label: string; className: string }[] = [
+  { key: "name",     label: "Nama",     className: "min-w-[160px]" },
+  { key: "username", label: "Username", className: "w-[140px]" },
+  { key: "email",    label: "Email",    className: "min-w-[200px]" },
+  { key: "role",     label: "Peran",    className: "w-[140px]" },
+  { key: "isActive", label: "Status",   className: "w-[110px]" },
+];
+
+const sortValue = (u: User, key: SortKey) => {
+  if (key === "isActive") return u.isActive ? "1" : "0";
+  if (key === "role") return ROLE_OPTIONS.find((r) => r.value === u.role)?.label ?? u.role;
+  return u[key];
+};
+
 const Users = () => {
   const searchTerm  = useAppSelector((s) => s.global.searchTerm) ?? "";
   const isDarkMode  = useAppSelector((s) => s.global.isDarkMode);
@@ -75,16 +108,43 @@ const Users = () => {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [formError, setFormError]         = useState("");
   const [notice, setNotice]               = useState("");
+  const [sort, setSort]                   = useState<SortState>(null);
+  // Error per kolom tampil setelah tombol simpan ditekan, lalu diperbarui saat mengetik
+  const [showErrors, setShowErrors]       = useState(false);
 
   const defaultForm: UserFormData = {
-    name: "", username: "", email: "", password: "", role: "admin_toko", isActive: true,
+    name: "", username: "", email: "", whatsapp: "", password: "", confirm: "", role: "admin_toko", isActive: true,
   };
   const [form, setForm] = useState<UserFormData>(defaultForm);
+
+  const isCreate = !editUser;
+  const formErrors = {
+    name:     personNameError(form.name),
+    username: usernameError(form.username),
+    email:    gmailError(form.email),
+    whatsapp: whatsappError(form.whatsapp),
+    password: isCreate ? passwordError(form.password, form.username) : "",
+    confirm:  isCreate ? confirmPasswordError(form.password, form.confirm) : "",
+  };
+  const resetErrors = {
+    password: passwordError(newPassword, resetTarget?.username, "Password baru"),
+    confirm:  confirmPasswordError(newPassword, confirmPassword),
+  };
+  const shown = (msg: string) => (showErrors ? msg : "");
 
   const term = searchTerm.trim().toLowerCase();
   const filteredUsers = (users ?? []).filter((u) =>
     !term || [u.name, u.username, u.email].some((v) => v.toLowerCase().includes(term))
   );
+  const sortedUsers = sort
+    ? [...filteredUsers].sort((a, b) => {
+        const cmp = sortValue(a, sort.key).localeCompare(sortValue(b, sort.key), "id", { sensitivity: "base" });
+        return sort.dir === "asc" ? cmp : -cmp;
+      })
+    : filteredUsers;
+
+  const toggleSort = (key: SortKey) =>
+    setSort((s) => (s?.key !== key ? { key, dir: "asc" } : s.dir === "asc" ? { key, dir: "desc" } : null));
 
   const isEditingSelf = !!editUser && editUser.userId === currentUser?.userId;
 
@@ -94,18 +154,25 @@ const Users = () => {
     setDeleteTarget(null);
     setResetTarget(null);
     setFormError("");
+    setShowErrors(false);
   };
 
   const handleCreateOpen = () => {
     setForm(defaultForm);
     setFormError("");
+    setShowErrors(false);
     setIsCreateOpen(true);
   };
 
   const handleEditOpen = (user: User) => {
     setEditUser(user);
-    setForm({ name: user.name, username: user.username, email: user.email, password: "", role: user.role, isActive: user.isActive });
+    setForm({
+      name: user.name, username: user.username, email: user.email,
+      whatsapp: user.whatsapp ? formatWhatsapp(user.whatsapp) : "",
+      password: "", confirm: "", role: user.role, isActive: user.isActive,
+    });
     setFormError("");
+    setShowErrors(false);
   };
 
   const handleResetOpen = (user: User) => {
@@ -113,22 +180,17 @@ const Users = () => {
     setNewPassword("");
     setConfirmPassword("");
     setFormError("");
-  };
-
-  const validateBasic = () => {
-    if (!form.name.trim() || !form.username.trim() || !form.email.trim()) return "Nama, username, dan email wajib diisi";
-    if (!/^[a-zA-Z0-9._]{3,30}$/.test(form.username.trim())) return "Username 3-30 karakter, hanya huruf, angka, titik, atau garis bawah";
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) return "Format email tidak valid";
-    return "";
+    setShowErrors(false);
   };
 
   const handleCreateSubmit = async () => {
-    const err = validateBasic();
-    if (err) return setFormError(err);
-    if (form.password.length < MIN_PASSWORD) return setFormError(`Password minimal ${MIN_PASSWORD} karakter`);
+    setFormError("");
+    setShowErrors(true);
+    if (Object.values(formErrors).some(Boolean)) return;
     try {
       const created = await createUser({
-        name: form.name.trim(), username: form.username.trim(), email: form.email.trim(),
+        name: squeeze(form.name), username: form.username.trim(), email: form.email.trim().toLowerCase(),
+        whatsapp: form.whatsapp.trim() || undefined,
         password: form.password, role: form.role,
       }).unwrap();
       setNotice(`Pengguna ${created.name} ditambahkan`);
@@ -140,14 +202,16 @@ const Users = () => {
 
   const handleEditSave = async () => {
     if (!editUser) return;
-    const err = validateBasic();
-    if (err) return setFormError(err);
+    setFormError("");
+    setShowErrors(true);
+    if (Object.values(formErrors).some(Boolean)) return;
     try {
       await updateUser({
         userId:   editUser.userId,
-        name:     form.name.trim(),
+        name:     squeeze(form.name),
         username: form.username.trim(),
-        email:    form.email.trim(),
+        email:    form.email.trim().toLowerCase(),
+        whatsapp: form.whatsapp.trim(), // "" = hapus nomor
         // Peran & status akun sendiri tidak dikirim (dikunci di server juga)
         ...(isEditingSelf ? {} : { role: form.role, isActive: form.isActive }),
       }).unwrap();
@@ -160,8 +224,9 @@ const Users = () => {
 
   const handleReset = async () => {
     if (!resetTarget) return;
-    if (newPassword.length < MIN_PASSWORD) return setFormError(`Password minimal ${MIN_PASSWORD} karakter`);
-    if (newPassword !== confirmPassword) return setFormError("Konfirmasi password tidak sama");
+    setFormError("");
+    setShowErrors(true);
+    if (Object.values(resetErrors).some(Boolean)) return;
     try {
       const res = await resetPassword({ userId: resetTarget.userId, newPassword }).unwrap();
       setNotice(`${res.message}. Sampaikan password baru kepada pengguna.`);
@@ -182,48 +247,6 @@ const Users = () => {
     }
   };
 
-  const columns: GridColDef[] = [
-    { field: "name",     headerName: "Nama",     flex: 1, minWidth: 160 },
-    { field: "username", headerName: "Username", width: 140 },
-    { field: "email",    headerName: "Email",    flex: 1, minWidth: 200 },
-    { field: "role",     headerName: "Peran",    width: 140, renderCell: (p) => getRoleBadge(p.value) },
-    {
-      field: "isActive",
-      headerName: "Status",
-      width: 110,
-      renderCell: (p) => p.value
-        ? <span className="flex h-full items-center gap-1 text-xs font-semibold text-green-600"><ShieldCheckIcon className="h-3.5 w-3.5" /> Aktif</span>
-        : <span className="flex h-full items-center gap-1 text-xs font-semibold text-red-500"><ShieldAlertIcon className="h-3.5 w-3.5" /> Nonaktif</span>,
-    },
-    {
-      field: "actions",
-      headerName: "Aksi",
-      width: 130,
-      sortable: false,
-      renderCell: (params) => {
-        const isSelf = params.row.userId === currentUser?.userId;
-        return (
-          <div className="flex h-full items-center gap-1">
-            <button onClick={() => handleEditOpen(params.row)} className="rounded p-1 text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/30" title="Ubah">
-              <PencilIcon className="h-4 w-4" />
-            </button>
-            <button onClick={() => handleResetOpen(params.row)} className="rounded p-1 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/30" title="Reset password">
-              <KeyRoundIcon className="h-4 w-4" />
-            </button>
-            <button
-              onClick={() => { if (!isSelf) { setFormError(""); setDeleteTarget(params.row); } }}
-              disabled={isSelf}
-              className={`rounded p-1 ${isSelf ? "cursor-not-allowed text-gray-300 dark:text-gray-600" : "text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30"}`}
-              title={isSelf ? "Tidak bisa menghapus akun sendiri" : "Hapus"}
-            >
-              <Trash2Icon className="h-4 w-4" />
-            </button>
-          </div>
-        );
-      },
-    },
-  ];
-
   if (isLoading) return <div className="py-4 dark:text-gray-100">Memuat pengguna...</div>;
   if (isError || !users) return <div className="py-4 text-center text-red-500">Gagal memuat data pengguna</div>;
 
@@ -234,39 +257,42 @@ const Users = () => {
   const btnSecondary = `px-4 py-2 rounded-lg text-sm ${isDarkMode ? "bg-gray-700 text-gray-200 hover:bg-gray-600" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`;
   const btnPrimary = "px-4 py-2 rounded-lg text-sm bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-60";
 
-  const dataGridSx = {
-    border: "none",
-    "& .MuiDataGrid-withBorderColor":  { borderColor: isDarkMode ? "#374151" : "#e5e7eb" },
-    "& .MuiDataGrid-cell":             { color: isDarkMode ? "#f3f4f6" : "#374151", borderColor: isDarkMode ? "#374151" : "#e5e7eb" },
-    "& .MuiDataGrid-columnHeaders":    { backgroundColor: isDarkMode ? "#1f2937" : "#f9fafb", borderColor: isDarkMode ? "#374151" : "#e5e7eb" },
-    "& .MuiDataGrid-columnHeader":     { backgroundColor: isDarkMode ? "#1f2937" : "#f9fafb" },
-    "& .MuiDataGrid-columnHeaderTitle":{ color: isDarkMode ? "#f3f4f6" : "#374151", fontWeight: 600 },
-    "& .MuiDataGrid-footerContainer":  { backgroundColor: isDarkMode ? "#1f2937" : "#f9fafb", color: isDarkMode ? "#f3f4f6" : "#374151", borderColor: isDarkMode ? "#374151" : "#e5e7eb" },
-    "& .MuiTablePagination-root":      { color: isDarkMode ? "#f3f4f6" : "#374151" },
-    "& .MuiIconButton-root":           { color: isDarkMode ? "#f3f4f6" : "#374151" },
-    "& .MuiDataGrid-virtualScroller":  { backgroundColor: isDarkMode ? "#111827" : "#ffffff" },
-    "& .MuiDataGrid-row":              { backgroundColor: isDarkMode ? "#111827" : "#ffffff" },
-    "& .MuiDataGrid-row:hover":        { backgroundColor: isDarkMode ? "#1f2937" : "#f3f4f6" },
-    "& .MuiDataGrid-overlay":          { backgroundColor: isDarkMode ? "#111827" : "#ffffff", color: isDarkMode ? "#9ca3af" : "#6b7280" },
-  };
-
   const errorBox = formError && (
     <div className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600 dark:bg-red-900/30 dark:text-red-400">{formError}</div>
   );
 
+  // Input dengan pesan error di bawahnya (input tanpa mb-3; jarak dari pembungkus)
+  const textField = (
+    label: string, error: string, input: React.ReactNode, hint?: string,
+  ) => (
+    <div className="mb-3">
+      <label className={labelCss}>{label}</label>
+      {input}
+      {error ? <FieldError message={error} /> : hint ? <p className="mt-1 text-xs text-gray-400">{hint}</p> : null}
+    </div>
+  );
+  const fieldCss = (error: string) =>
+    `${inputCss.replace("mb-3 ", "")} ${error ? "!border-red-400" : ""}`;
+
   const renderFormFields = (isEdit: boolean) => (
     <>
       {errorBox}
-      <label className={labelCss}>Nama Lengkap</label>
-      <input type="text" placeholder="Nama lengkap" value={form.name} onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))} className={inputCss} />
-      <label className={labelCss}>Username</label>
-      <input type="text" placeholder="username" value={form.username} onChange={(e) => setForm((p) => ({ ...p, username: e.target.value }))} className={inputCss} />
-      <label className={labelCss}>Email</label>
-      <input type="email" placeholder="email@contoh.com" value={form.email} onChange={(e) => setForm((p) => ({ ...p, email: e.target.value }))} className={inputCss} />
+      {textField("Nama Lengkap", shown(formErrors.name),
+        <input type="text" placeholder="Nama lengkap" maxLength={MAX_LEN.personName} value={form.name} onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))} className={fieldCss(shown(formErrors.name))} />)}
+      {textField("Username", shown(formErrors.username),
+        <input type="text" placeholder="username" maxLength={MAX_LEN.username} value={form.username} onChange={(e) => setForm((p) => ({ ...p, username: e.target.value.replace(/\s/g, "") }))} className={fieldCss(shown(formErrors.username))} />)}
+      {textField("Email (Gmail)", shown(formErrors.email),
+        <input type="email" inputMode="email" placeholder="nama@gmail.com" maxLength={MAX_LEN.email} value={form.email} onChange={(e) => setForm((p) => ({ ...p, email: e.target.value }))} className={fieldCss(shown(formErrors.email))} />)}
+      {textField("Nomor WhatsApp (opsional)", shown(formErrors.whatsapp),
+        <input type="tel" inputMode="tel" placeholder="0812 3456 7890" maxLength={20} value={form.whatsapp} onChange={(e) => setForm((p) => ({ ...p, whatsapp: e.target.value }))} className={fieldCss(shown(formErrors.whatsapp))} />,
+        "Untuk tombol \"Kirim via WA\" notifikasi Purchase Order & Store Replenishment.")}
       {!isEdit && (
         <>
-          <label className={labelCss}>Password</label>
-          <input type="password" placeholder={`Minimal ${MIN_PASSWORD} karakter`} value={form.password} onChange={(e) => setForm((p) => ({ ...p, password: e.target.value }))} className={inputCss} />
+          {textField("Password", shown(formErrors.password),
+            <input type="password" autoComplete="new-password" maxLength={MAX_PASSWORD} value={form.password} onChange={(e) => setForm((p) => ({ ...p, password: e.target.value }))} className={fieldCss(shown(formErrors.password))} />,
+            PASSWORD_HINT)}
+          {textField("Ulangi Password", shown(formErrors.confirm),
+            <input type="password" autoComplete="new-password" maxLength={MAX_PASSWORD} value={form.confirm} onChange={(e) => setForm((p) => ({ ...p, confirm: e.target.value }))} className={fieldCss(shown(formErrors.confirm))} />)}
         </>
       )}
       <label className={labelCss}>Peran</label>
@@ -307,17 +333,87 @@ const Users = () => {
         </div>
       )}
 
-      <DataGrid
-        rows={filteredUsers}
-        columns={columns}
-        disableColumnMenu
-        rowHeight={56}
-        getRowId={(row: User) => row.userId}
-        disableRowSelectionOnClick
-        localeText={{ noRowsLabel: "Tidak ada pengguna" }}
-        className={`rounded-lg border shadow ${isDarkMode ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}`}
-        sx={dataGridSx}
-      />
+      <div className={`overflow-x-auto rounded-lg border shadow ${isDarkMode ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}`}>
+        <table className="min-w-full text-sm">
+          <thead className="bg-gray-50 dark:bg-gray-800">
+            <tr className="border-b border-gray-200 dark:border-gray-700">
+              {SORT_COLUMNS.map((c) => {
+                const dir = sort?.key === c.key ? sort.dir : undefined;
+                const SortIcon = dir === "desc" ? ArrowDownIcon : ArrowUpIcon;
+                return (
+                  <th
+                    key={c.key}
+                    aria-sort={dir === "asc" ? "ascending" : dir === "desc" ? "descending" : "none"}
+                    className={`px-4 py-3 text-left ${c.className}`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleSort(c.key)}
+                      className="group inline-flex items-center gap-1 font-semibold text-gray-700 dark:text-gray-100"
+                    >
+                      {c.label}
+                      <SortIcon className={`h-3.5 w-3.5 transition-opacity ${dir ? "opacity-100" : "opacity-0 group-hover:opacity-40"}`} />
+                    </button>
+                  </th>
+                );
+              })}
+              <th className="w-[130px] px-4 py-3 text-left font-semibold text-gray-700 dark:text-gray-100">Aksi</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedUsers.length === 0 ? (
+              <tr>
+                <td colSpan={SORT_COLUMNS.length + 1} className="px-4 py-10 text-center text-gray-500 dark:text-gray-400">
+                  Tidak ada pengguna
+                </td>
+              </tr>
+            ) : (
+              sortedUsers.map((u) => {
+                const isSelf = u.userId === currentUser?.userId;
+                return (
+                  <tr
+                    key={u.userId}
+                    className="h-14 border-b border-gray-200 text-gray-700 last:border-b-0 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-800"
+                  >
+                    <td className="px-4">{u.name}</td>
+                    <td className="px-4">{u.username}</td>
+                    <td className="px-4">
+                      {u.email}
+                      {u.whatsapp && (
+                        <span className="block text-xs text-gray-400">WA {formatWhatsapp(u.whatsapp)}</span>
+                      )}
+                    </td>
+                    <td className="px-4">{getRoleBadge(u.role)}</td>
+                    <td className="px-4">
+                      {u.isActive
+                        ? <span className="flex items-center gap-1 text-xs font-semibold text-green-600"><ShieldCheckIcon className="h-3.5 w-3.5" /> Aktif</span>
+                        : <span className="flex items-center gap-1 text-xs font-semibold text-red-500"><ShieldAlertIcon className="h-3.5 w-3.5" /> Nonaktif</span>}
+                    </td>
+                    <td className="px-4">
+                      <div className="flex items-center gap-1">
+                        <button onClick={() => handleEditOpen(u)} className="rounded p-1 text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/30" title="Ubah">
+                          <PencilIcon className="h-4 w-4" />
+                        </button>
+                        <button onClick={() => handleResetOpen(u)} className="rounded p-1 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/30" title="Reset password">
+                          <KeyRoundIcon className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => { if (!isSelf) { setFormError(""); setDeleteTarget(u); } }}
+                          disabled={isSelf}
+                          className={`rounded p-1 ${isSelf ? "cursor-not-allowed text-gray-300 dark:text-gray-600" : "text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30"}`}
+                          title={isSelf ? "Tidak bisa menghapus akun sendiri" : "Hapus"}
+                        >
+                          <Trash2Icon className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
 
       {/* MODAL TAMBAH */}
       {isCreateOpen && (
@@ -368,10 +464,11 @@ const Users = () => {
             <p className="mb-3 text-sm text-gray-600 dark:text-gray-300">
               Atur password baru untuk <span className="font-semibold">{resetTarget.name}</span> (@{resetTarget.username}).
             </p>
-            <label className={labelCss}>Password Baru</label>
-            <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder={`Minimal ${MIN_PASSWORD} karakter`} className={inputCss} />
-            <label className={labelCss}>Ulangi Password Baru</label>
-            <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} className={inputCss} />
+            {textField("Password Baru", shown(resetErrors.password),
+              <input type="password" autoComplete="new-password" maxLength={MAX_PASSWORD} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} className={fieldCss(shown(resetErrors.password))} />,
+              PASSWORD_HINT)}
+            {textField("Ulangi Password Baru", shown(resetErrors.confirm),
+              <input type="password" autoComplete="new-password" maxLength={MAX_PASSWORD} value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} className={fieldCss(shown(resetErrors.confirm))} />)}
             <div className="mt-2 flex justify-end gap-2">
               <button onClick={closeAll} className={btnSecondary}>Batal</button>
               <button onClick={handleReset} disabled={resetting} className="rounded-lg bg-brand-500 px-4 py-2 text-sm text-white hover:bg-brand-600 disabled:opacity-60">

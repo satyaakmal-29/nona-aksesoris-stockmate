@@ -1,15 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import Header from "@/app/(components)/Header";
 import QrisCode from "@/app/(components)/QrisCode";
-import { useAppSelector } from "@/app/redux";
+import { useAppDispatch, useAppSelector } from "@/app/redux";
 import {
+  api,
   useGetTransactionsQuery,
+  useGetTransactionByIdQuery,
   useCreateTransactionMutation,
   useConfirmTransactionPaymentMutation,
   useCancelTransactionMutation,
+  useEmailTransactionReceiptMutation,
   useGetStockTokoQuery,
   useGetStoreSettingsQuery,
   Product,
@@ -23,10 +26,13 @@ import {
   BanknoteIcon,
   CalendarClockIcon,
   CheckCircleIcon,
+  CheckIcon,
   ClockIcon,
+  CopyIcon,
   ImageIcon,
   LandmarkIcon,
   LockIcon,
+  MailIcon,
   MinusIcon,
   PlusIcon,
   QrCodeIcon,
@@ -36,28 +42,32 @@ import {
   PrinterIcon,
   ReceiptIcon,
   SearchIcon,
+  SendIcon,
   ShoppingCartIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
 import { toLocalISODate, formatLongDate } from "@/lib/reportExport";
 import { isLowToko } from "@/lib/stockThresholds";
+import FieldError from "@/app/(components)/FieldError";
+import { CASH_OVERPAY_MAX, MAX_LEN, TRX_QTY_MAX, customerEmailError, squeeze } from "@/lib/validation";
+import {
+  PAYMENT_LABELS,
+  RECEIPT_PAPER_MM,
+  StoreInfo,
+  buildReceiptHtml,
+  formatAccountNumber,
+  printReceipt,
+} from "@/lib/receipt";
 
 // ── Konstanta & helper ────────────────────────────────────────────
 // Nama & alamat toko diambil dari Pengaturan (Super Admin); ini nilai cadangan
-type StoreInfo = { storeName: string; storeAddress: string };
 const DEFAULT_STORE: StoreInfo = { storeName: "Nona Aksesoris", storeAddress: "Jl. Madukara, Jeruklegi, Cilacap" };
 
 const STATUS_BADGE: Record<string, { label: string; color: string }> = {
   paid:            { label: "Lunas",               color: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300" },
   pending_payment: { label: "Menunggu Pembayaran", color: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300" },
   cancelled:       { label: "Dibatalkan",          color: "bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-300" },
-};
-
-const PAYMENT_LABELS: Record<string, string> = {
-  cash:     "Tunai",
-  transfer: "Transfer",
-  qris:     "QRIS",
 };
 
 const PAYMENT_COLORS: Record<string, string> = {
@@ -86,8 +96,19 @@ const getErrorMessage = (err: unknown, fallback: string) => {
   return e?.data?.message ?? fallback;
 };
 
-const escapeHtml = (s: string) =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+// ── Status nota email ─────────────────────────────────────────────
+const EMAIL_STATUS_COLORS: Record<string, string> = {
+  sending: "text-gray-500 dark:text-gray-400",
+  sent:    "text-green-600 dark:text-green-400",
+  failed:  "text-red-500 dark:text-red-400",
+};
+
+const emailStatusText = (trx: Transaction) =>
+  trx.receiptEmailStatus === "sending" ? "Mengirim nota ke email..."
+    : trx.receiptEmailStatus === "failed"
+      ? `Nota email gagal dikirim${trx.receiptEmailError ? `: ${trx.receiptEmailError}` : ""}` +
+        (trx.receiptEmailTo ? ` (sudah diterima: ${trx.receiptEmailTo})` : "")
+      : `Nota email terkirim ke ${trx.receiptEmailTo ?? "-"}`;
 
 // ── Input Rupiah (hanya angka, titik ribuan otomatis) ─────────────
 const PriceInput = ({
@@ -107,51 +128,14 @@ const PriceInput = ({
       value={value ? value.toLocaleString("id-ID") : ""}
       placeholder="0"
       onChange={(e) => {
-        const digits = e.target.value.replace(/\D/g, "");
+        // Maks 10 digit (cegah angka tidak wajar)
+        const digits = e.target.value.replace(/\D/g, "").slice(0, 10);
         onChange(digits ? Number(digits) : 0);
       }}
       className={`${className} pl-9`}
     />
   </div>
 );
-
-// ── Struk ─────────────────────────────────────────────────────────
-// HTML struk dengan style inline: dipakai untuk pratinjau & jendela cetak
-// (class Tailwind tidak tersedia di jendela cetak).
-const buildStrukHtml = (trx: Transaction, store: StoreInfo): string => {
-  const date = new Date(trx.createdAt);
-  const row = (left: string, right: string, bold = false) =>
-    `<div style="display:flex;justify-content:space-between;gap:8px;${bold ? "font-weight:bold;font-size:13px;" : ""}"><span>${left}</span><span style="white-space:nowrap">${right}</span></div>`;
-  const line = `<div style="border-top:1px dashed #999;margin:8px 0"></div>`;
-
-  const items = trx.Items.map((it) => `
-    <div style="margin-bottom:4px">
-      <div style="font-weight:600">${escapeHtml(it.productName)}${it.variantName ? ` (${escapeHtml(it.variantName)})` : ""}</div>
-      ${row(`${it.qty} x ${formatRupiah(it.unitPrice)}`, formatRupiah(it.subtotal))}
-    </div>`).join("");
-
-  return `
-  <div style="font-family:'Courier New',monospace;font-size:12px;color:#000;background:#fff;width:280px;margin:0 auto;padding:12px">
-    <div style="text-align:center">
-      <div style="font-size:15px;font-weight:bold">${escapeHtml(store.storeName)}</div>
-      <div style="font-size:11px;color:#555">${escapeHtml(store.storeAddress)}</div>
-    </div>
-    ${line}
-    ${row(date.toLocaleDateString("id-ID"), date.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" }))}
-    <div>No: ${escapeHtml(trx.transactionNumber)}</div>
-    <div>Kasir: ${escapeHtml(trx.cashier?.name ?? "-")}</div>
-    ${trx.customerName ? `<div>Pelanggan: ${escapeHtml(trx.customerName)}</div>` : ""}
-    ${line}
-    ${items}
-    ${line}
-    ${row("Total Qty", String(trx.Items.reduce((s, i) => s + i.qty, 0)))}
-    ${row("Total", formatRupiah(trx.totalAmount), true)}
-    ${row(`Bayar (${PAYMENT_LABELS[trx.paymentMethod] ?? trx.paymentMethod})`, formatRupiah(trx.paymentAmount))}
-    ${row("Kembali", formatRupiah(trx.changeAmount))}
-    ${line}
-    <div style="text-align:center;color:#555">Terima kasih telah berbelanja</div>
-  </div>`;
-};
 
 // ── Kartu transaksi ───────────────────────────────────────────────
 const TrxCard = ({
@@ -216,9 +200,28 @@ const TrxCard = ({
             <span>Kembalian: {formatRupiah(trx.changeAmount)}</span>
           </div>
           {trx.notes && <p className="mb-3 text-xs text-gray-500 dark:text-gray-400">📝 {trx.notes}</p>}
+          {trx.paymentMethod === "transfer" && (
+            <p className="mb-3 flex items-start gap-1.5 text-xs text-gray-500 dark:text-gray-400">
+              <LandmarkIcon className="mt-px h-3.5 w-3.5 shrink-0" />
+              {trx.transferAccountNumber ? (
+                <span>
+                  Transfer ke <b className="text-gray-700 dark:text-gray-200">{trx.transferBankName}</b>{" "}
+                  <span className="font-mono">{formatAccountNumber(trx.transferAccountNumber)}</span> a.n. {trx.transferAccountName}
+                </span>
+              ) : (
+                <span>Rekening tujuan tidak tercatat (transaksi dibuat sebelum rekening disimpan per transaksi).</span>
+              )}
+            </p>
+          )}
           {trx.paymentMethod === "qris" && trx.status === "paid" && trx.paidAt && (
             <p className="mb-3 text-xs text-green-600 dark:text-green-400">
               ✓ Pembayaran QRIS dikonfirmasi {trx.confirmedBy?.name ? `oleh ${trx.confirmedBy.name} ` : ""}• {formatDateTime(trx.paidAt)}
+            </p>
+          )}
+          {trx.status === "paid" && trx.receiptEmailStatus && (
+            <p className={`mb-3 flex items-start gap-1.5 text-xs ${EMAIL_STATUS_COLORS[trx.receiptEmailStatus]}`}>
+              <MailIcon className="mt-px h-3.5 w-3.5 shrink-0" />
+              <span>{emailStatusText(trx)}</span>
             </p>
           )}
           {trx.status === "cancelled" && (
@@ -354,6 +357,93 @@ const resolveLine = (products: Product[] | undefined, item: DraftItem) => {
   return { product, variants, variant, needsVariant, price, stock, stockKey, label };
 };
 
+// ── Nota digital (email) di modal struk ──────────────────────────
+// Status dipantau tiap 2 detik selama masih "sending" (nota dikirim server di latar belakang).
+// Kasir bisa mengisi / mengganti email pembeli lalu mengirim (ulang) nota.
+const ReceiptEmailPanel = ({
+  initial,
+  emailReady,
+  inputCss,
+}: {
+  initial: Transaction;
+  emailReady: boolean;
+  inputCss: string;
+}) => {
+  const dispatch = useAppDispatch();
+  const transactionId = initial.transactionId;
+  const [sent, setSent]   = useState<Transaction | null>(null); // hasil kirim manual terakhir
+  const [email, setEmail] = useState(initial.customerEmail ?? "");
+  const [error, setError] = useState("");
+  const [emailReceipt, { isLoading: sending }] = useEmailTransactionReceiptMutation();
+
+  const selectCached = useMemo(() => api.endpoints.getTransactionById.select(transactionId), [transactionId]);
+  const cached = useAppSelector((s) => selectCached(s).data);
+  const latest = sent ?? cached ?? initial;
+  const watching = latest.receiptEmailStatus === "sending";
+  useGetTransactionByIdQuery(transactionId, { skip: !watching, pollingInterval: watching ? 2000 : 0 });
+
+  // Selesai dikirim → segarkan daftar transaksi agar status di kartu ikut berubah
+  const startedSending = initial.receiptEmailStatus === "sending";
+  const status = latest.receiptEmailStatus;
+  useEffect(() => {
+    if (startedSending && (status === "sent" || status === "failed")) {
+      dispatch(api.util.invalidateTags(["Transactions"]));
+    }
+  }, [startedSending, status, dispatch]);
+
+  const handleSend = async () => {
+    setError("");
+    const err = customerEmailError(email);
+    if (err) return setError(err);
+    try {
+      setSent(await emailReceipt({ transactionId, email: email.trim().toLowerCase() }).unwrap());
+    } catch (e) {
+      setError(getErrorMessage(e, "Nota gagal dikirim"));
+    }
+  };
+
+  return (
+    <div className="mx-5 mb-3 rounded-lg border border-gray-200 p-3 dark:border-gray-700">
+      <p className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-gray-700 dark:text-gray-200">
+        <MailIcon className="h-3.5 w-3.5" /> Nota digital (email)
+      </p>
+      {!emailReady ? (
+        <p className="text-[11px] text-orange-600 dark:text-orange-400">
+          Belum aktif. Super Admin perlu mengatur Gmail toko di menu Pengaturan.
+        </p>
+      ) : (
+        <>
+          <p className={`mb-2 text-[11px] ${status ? EMAIL_STATUS_COLORS[status] : "text-gray-500 dark:text-gray-400"}`}>
+            {status ? emailStatusText(latest) : "Belum dikirim."}
+          </p>
+          <div className="flex gap-2">
+            <input
+              type="email"
+              inputMode="email"
+              maxLength={MAX_LEN.customerEmail}
+              value={email}
+              onChange={(e) => { setEmail(e.target.value); setError(""); }}
+              placeholder="Email pembeli (opsional)"
+              className={`${inputCss} !py-1.5 !text-xs`}
+            />
+            <button
+              onClick={handleSend}
+              disabled={sending || watching}
+              className="flex shrink-0 items-center gap-1 rounded-lg bg-brand-500 px-3 text-xs font-semibold text-white hover:bg-brand-600 disabled:opacity-60"
+            >
+              <SendIcon className="h-3.5 w-3.5" /> {sending ? "Mengirim..." : "Kirim"}
+            </button>
+          </div>
+          <FieldError message={error} />
+          <p className="mt-1 text-[10px] text-gray-400">
+            Kosongkan email untuk mengirim ulang nota ke email toko saja.
+          </p>
+        </>
+      )}
+    </div>
+  );
+};
+
 // ── Halaman ───────────────────────────────────────────────────────
 const TransactionsPage = () => {
   const isDarkMode  = useAppSelector((s) => s.global.isDarkMode);
@@ -377,6 +467,9 @@ const TransactionsPage = () => {
   const { data: storeSettings } = useGetStoreSettingsQuery();
   const store: StoreInfo = storeSettings ?? DEFAULT_STORE;
   const qrisReady = !!storeSettings?.qrisConfigured;
+  const transferReady = !!storeSettings?.bankConfigured;
+  const emailReady = !!storeSettings?.emailConfigured;
+  const canSendEmail = role === "admin_toko" || role === "super_admin";
   const [createTransaction, { isLoading: submitting }] = useCreateTransactionMutation();
   const [confirmPayment, { isLoading: confirming }] = useConfirmTransactionPaymentMutation();
   const [cancelTransaction, { isLoading: cancelling }] = useCancelTransactionMutation();
@@ -395,12 +488,26 @@ const TransactionsPage = () => {
 
   // Form
   const [customerName, setCustomerName]   = useState("");
+  const [customerEmail, setCustomerEmail] = useState("");
+  const [emailTouched, setEmailTouched]   = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "transfer" | "qris">("cash");
   const [paymentAmount, setPaymentAmount] = useState(0);
   const [notes, setNotes]                 = useState("");
   const [items, setItems] = useState<DraftItem[]>([]);
   const [catalogSearch, setCatalogSearch]     = useState("");
   const [catalogCategory, setCatalogCategory] = useState("");
+  const [accountCopied, setAccountCopied]     = useState(false);
+
+  const copyAccountNumber = async () => {
+    if (!storeSettings?.bankAccountNumber) return;
+    try {
+      await navigator.clipboard.writeText(storeSettings.bankAccountNumber);
+      setAccountCopied(true);
+      setTimeout(() => setAccountCopied(false), 2000);
+    } catch {
+      // Clipboard tidak tersedia: nomor tetap terlihat di layar
+    }
+  };
 
   const applyFilter = () => {
     if (startDate && endDate && startDate > endDate) {
@@ -420,6 +527,8 @@ const TransactionsPage = () => {
   const openCreate = () => {
     setModalError("");
     setCustomerName("");
+    setCustomerEmail("");
+    setEmailTouched(false);
     setPaymentMethod("cash");
     setPaymentAmount(0);
     setNotes("");
@@ -433,7 +542,7 @@ const TransactionsPage = () => {
   const addToCart = (entry: CatalogEntry) =>
     setItems((p) =>
       p.some((it) => it.key === entry.key)
-        ? p.map((it) => (it.key === entry.key ? { ...it, qty: (it.qty || 0) + 1 } : it))
+        ? p.map((it) => (it.key === entry.key ? { ...it, qty: Math.min(TRX_QTY_MAX, (it.qty || 0) + 1) } : it))
         : [...p, { key: entry.key, productId: entry.productId, variantId: entry.variantId, qty: 1 }]
     );
   const removeItem = (key: string) => setItems((p) => p.filter((it) => it.key !== key));
@@ -461,6 +570,14 @@ const TransactionsPage = () => {
   const stockProblems = lines.filter((l) => l.stockKey && (requested.get(l.stockKey) ?? 0) > l.stock);
   const effectivePaid = paymentMethod === "cash" ? paymentAmount : totalAmount;
   const changeAmount  = effectivePaid - totalAmount;
+  // Uang tunai maks = total + Rp 1 juta (cegah salah ketik nol berlebih)
+  const cashMax = totalAmount + CASH_OVERPAY_MAX;
+  const cashTooLarge = paymentMethod === "cash" && totalAmount > 0 && paymentAmount > cashMax;
+  const cashError = cashTooLarge
+    ? `Terlalu besar. Maksimal ${formatRupiah(cashMax)} (total + ${formatRupiah(CASH_OVERPAY_MAX)}).`
+    : "";
+  // Email pembeli (nota digital): error tampil setelah kolom ditinggalkan / tombol proses ditekan
+  const customerEmailErr = customerEmailError(customerEmail);
 
   const handleCreate = async () => {
     setModalError("");
@@ -469,26 +586,37 @@ const TransactionsPage = () => {
     for (const l of lines) {
       if (!l.product) return setModalError("Ada produk di keranjang yang sudah tidak tersedia. Hapus lalu pilih ulang.");
       if (l.needsVariant && !l.variant) return setModalError(`Pilih varian "${l.product.name}"`);
-      if (!Number.isInteger(l.it.qty) || l.it.qty < 1) return setModalError(`Jumlah "${l.label}" minimal 1`);
+      if (!Number.isInteger(l.it.qty) || l.it.qty < 1 || l.it.qty > TRX_QTY_MAX) {
+        return setModalError(`Jumlah "${l.label}" harus 1 – ${TRX_QTY_MAX}`);
+      }
       if (!(l.price > 0)) return setModalError(`Harga "${l.label}" belum diatur`);
     }
     if (stockProblems.length > 0) {
       const l = stockProblems[0];
       return setModalError(`Stok toko "${l.label}" tidak cukup. Tersedia ${l.stock}, diminta ${requested.get(l.stockKey)}.`);
     }
+    if (paymentMethod === "transfer" && !transferReady) {
+      return setModalError("Rekening transfer toko belum diatur. Minta Super Admin mengisi rekening di menu Pengaturan.");
+    }
     if (paymentMethod === "cash") {
       if (!(paymentAmount > 0)) return setModalError("Isi jumlah uang yang dibayar");
       if (paymentAmount < totalAmount) {
         return setModalError(`Pembayaran kurang ${formatRupiah(totalAmount - paymentAmount)}. Total ${formatRupiah(totalAmount)}.`);
       }
+      if (cashTooLarge) return setModalError(`Uang dibayar ${cashError} Periksa kembali nominalnya.`);
+    }
+    if (customerEmailErr) {
+      setEmailTouched(true);
+      return setModalError(customerEmailErr);
     }
 
     try {
       const payload: NewTransaction = {
-        customerName:  customerName.trim() || undefined,
+        customerName:  squeeze(customerName) || undefined,
+        customerEmail: (emailReady && customerEmail.trim().toLowerCase()) || undefined,
         paymentMethod,
         paymentAmount: paymentMethod === "cash" ? paymentAmount : undefined,
-        notes:         notes.trim() || undefined,
+        notes:         squeeze(notes) || undefined,
         items: lines.map((l) => ({
           productId: l.it.productId,
           variantId: l.it.variantId || undefined,
@@ -543,20 +671,9 @@ const TransactionsPage = () => {
   const handlePrint = () => {
     if (!printTarget) return;
     setPrintError("");
-    const win = window.open("", "_blank", "width=420,height=640");
-    if (!win) {
+    if (!printReceipt(printTarget, store)) {
       setPrintError("Jendela cetak diblokir browser. Izinkan pop-up untuk situs ini, lalu coba lagi.");
-      return;
     }
-    win.document.write(
-      `<!doctype html><html><head><title>Struk ${escapeHtml(printTarget.transactionNumber)}</title>` +
-      `<style>@page{margin:6mm}body{margin:0}</style></head><body>${buildStrukHtml(printTarget, store)}</body></html>`
-    );
-    win.document.close();
-    win.onafterprint = () => win.close();
-    win.focus();
-    // beri waktu jendela selesai dirender sebelum dialog cetak
-    setTimeout(() => win.print(), 250);
   };
 
   const modalBg = "fixed inset-0 z-50 flex items-center justify-center";
@@ -810,7 +927,29 @@ const TransactionsPage = () => {
 
                 <div>
                   <label htmlFor="trx-customer" className={labelCss}>Nama Pelanggan (opsional)</label>
-                  <input id="trx-customer" type="text" value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Nama pelanggan..." className={inputCss} />
+                  <input id="trx-customer" type="text" maxLength={MAX_LEN.customerName} value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Nama pelanggan..." className={inputCss} />
+                </div>
+
+                <div>
+                  <label htmlFor="trx-email" className={labelCss}>Email Pembeli (opsional, nota digital)</label>
+                  <input
+                    id="trx-email"
+                    type="email"
+                    inputMode="email"
+                    maxLength={MAX_LEN.customerEmail}
+                    value={customerEmail}
+                    disabled={!emailReady}
+                    onChange={(e) => setCustomerEmail(e.target.value)}
+                    onBlur={() => setEmailTouched(true)}
+                    placeholder={emailReady ? "nama@gmail.com" : "Nota email belum aktif"}
+                    className={`${inputCss} disabled:opacity-60 ${emailTouched && customerEmailErr ? "!border-red-400" : ""}`}
+                  />
+                  <FieldError message={emailTouched ? customerEmailErr : ""} />
+                  <p className="mt-1 text-[11px] text-gray-400">
+                    {emailReady
+                      ? "Pembeli pilih nota cetak atau nota digital. Jika diisi, nota dikirim ke email ini; salinan selalu masuk ke email toko."
+                      : "Super Admin perlu mengatur Gmail toko di menu Pengaturan agar nota bisa dikirim lewat email."}
+                  </p>
                 </div>
 
                 <div>
@@ -877,17 +1016,18 @@ const TransactionsPage = () => {
                                     <input
                                       type="number"
                                       min={1}
-                                      max={l.stock || undefined}
+                                      max={Math.min(l.stock || TRX_QTY_MAX, TRX_QTY_MAX)}
                                       step={1}
                                       value={qty || ""}
-                                      onChange={(e) => patchItem(l.it.key, { qty: Math.floor(Number(e.target.value)) })}
+                                      onChange={(e) => patchItem(l.it.key, { qty: Math.min(TRX_QTY_MAX, Math.floor(Number(e.target.value))) })}
                                       aria-label="Jumlah"
                                       className={`h-7 w-11 border-x bg-transparent text-center text-sm font-semibold focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${isDarkMode ? "border-gray-600" : "border-gray-300"}`}
                                     />
                                     <button
                                       type="button"
                                       onClick={() => patchItem(l.it.key, { qty: qty + 1 })}
-                                      disabled={qty >= l.stock}
+                                      disabled={qty >= l.stock || qty >= TRX_QTY_MAX}
+                                      title={qty >= TRX_QTY_MAX ? `Maksimal ${TRX_QTY_MAX} per item` : undefined}
                                       aria-label="Tambah jumlah"
                                       className="flex h-7 w-7 items-center justify-center text-gray-500 hover:text-brand-600 disabled:opacity-30"
                                     >
@@ -925,12 +1065,16 @@ const TransactionsPage = () => {
                   <div className="flex gap-2">
                     {(["cash", "transfer", "qris"] as const).map((m) => {
                       const Icon = PAYMENT_ICONS[m];
+                      const notReady =
+                        m === "qris" && !qrisReady ? "QRIS toko belum diatur Super Admin"
+                        : m === "transfer" && !transferReady ? "Rekening transfer belum diatur Super Admin"
+                        : undefined;
                       return (
                         <button
                           key={m}
                           type="button"
-                          disabled={m === "qris" && !qrisReady}
-                          title={m === "qris" && !qrisReady ? "QRIS toko belum diatur Super Admin" : undefined}
+                          disabled={!!notReady}
+                          title={notReady}
                           onClick={() => setPaymentMethod(m)}
                           className={`flex flex-1 flex-col items-center gap-1 rounded-lg border-2 py-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                             paymentMethod === m
@@ -944,6 +1088,9 @@ const TransactionsPage = () => {
                       );
                     })}
                   </div>
+                  {!transferReady && (
+                    <p className="mt-1 text-xs text-gray-400">Transfer belum aktif — Super Admin perlu mengisi rekening toko di Pengaturan.</p>
+                  )}
                   {!qrisReady && (
                     <p className="mt-1 text-xs text-gray-400">QRIS belum aktif — Super Admin perlu mengunggah QRIS toko di Pengaturan.</p>
                   )}
@@ -954,7 +1101,8 @@ const TransactionsPage = () => {
                     <div className="grid grid-cols-2 gap-3">
                       <div>
                         <label className={labelCss}>Uang Dibayar</label>
-                        <PriceInput value={paymentAmount} onChange={setPaymentAmount} className={inputCss} />
+                        <PriceInput value={paymentAmount} onChange={setPaymentAmount} className={`${inputCss} ${cashTooLarge ? "!border-red-400" : ""}`} />
+                        <FieldError message={cashError} />
                       </div>
                       <div>
                         <label htmlFor="trx-change" className={labelCss}>Kembalian</label>
@@ -995,15 +1143,47 @@ const TransactionsPage = () => {
                     Setelah diproses, QRIS bernominal {formatRupiah(totalAmount)} akan tampil untuk dipindai pembeli.
                     Stok baru dikurangi setelah Anda mengonfirmasi dana masuk.
                   </p>
+                ) : transferReady && storeSettings?.bankAccountNumber ? (
+                  <div className="rounded-xl border-2 border-brand-200 bg-brand-50/60 p-4 dark:border-brand-500/30 dark:bg-brand-500/10">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-brand-700 dark:text-brand-300">Transfer ke rekening toko</p>
+                    <div className="mt-2 flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-gray-700 dark:text-gray-200">{storeSettings.bankName}</p>
+                        <p className="font-mono text-xl font-bold tracking-wider text-gray-900 dark:text-gray-50">
+                          {formatAccountNumber(storeSettings.bankAccountNumber)}
+                        </p>
+                        <p className="text-sm text-gray-600 dark:text-gray-300">
+                          a.n. <span className="font-semibold">{storeSettings.bankAccountName}</span>
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={copyAccountNumber}
+                        className={`flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold ${isDarkMode ? "bg-gray-700 text-gray-200 hover:bg-gray-600" : "bg-white text-gray-700 shadow-sm hover:bg-brand-100"}`}
+                      >
+                        {accountCopied ? <CheckIcon className="h-3.5 w-3.5 text-green-500" /> : <CopyIcon className="h-3.5 w-3.5" />}
+                        {accountCopied ? "Tersalin" : "Salin"}
+                      </button>
+                    </div>
+                    <div className="mt-3 flex items-center justify-between border-t border-brand-200 pt-3 dark:border-brand-500/30">
+                      <span className="text-xs text-gray-600 dark:text-gray-300">Nominal transfer (harus pas)</span>
+                      <span className="text-lg font-bold text-brand-600 dark:text-brand-300">{formatRupiah(totalAmount)}</span>
+                    </div>
+                    <ol className="mt-3 space-y-1 text-xs text-gray-600 dark:text-gray-300">
+                      <li>1. Minta pembeli transfer <b>tepat {formatRupiah(totalAmount)}</b> ke rekening di atas.</li>
+                      <li>2. Cek bukti transfer: bank & nomor rekening tujuan, nama penerima, nominal, dan tanggal.</li>
+                      <li>3. Tekan <b>Bukti transfer sudah dicek</b> — transaksi lunas, stok berkurang, struk terbit.</li>
+                    </ol>
+                  </div>
                 ) : (
-                  <p className="rounded-lg bg-brand-50 px-3 py-2 text-xs text-brand-700 dark:bg-brand-500/10 dark:text-brand-300">
-                    Pembayaran {PAYMENT_LABELS[paymentMethod]} dicatat sebesar total belanja ({formatRupiah(totalAmount)}), tanpa kembalian.
+                  <p className="rounded-lg bg-orange-50 px-3 py-2 text-xs text-orange-700 dark:bg-orange-900/30 dark:text-orange-300">
+                    Rekening transfer toko belum diatur. Pilih metode lain, atau minta Super Admin mengisi rekening di Pengaturan.
                   </p>
                 )}
 
                 <div>
                   <label htmlFor="trx-notes" className={labelCss}>Catatan (opsional)</label>
-                  <textarea id="trx-notes" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className={`${inputCss} resize-none`} />
+                  <textarea id="trx-notes" maxLength={MAX_LEN.note} value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className={`${inputCss} resize-none`} />
                 </div>
               </section>
             </div>
@@ -1016,11 +1196,16 @@ const TransactionsPage = () => {
                 <button onClick={() => setIsCreateOpen(false)} className={btnSecondary}>Batal</button>
                 <button
                   onClick={handleCreate}
-                  disabled={submitting || stockProblems.length > 0 || totalAmount <= 0}
+                  disabled={submitting || stockProblems.length > 0 || totalAmount <= 0 || (paymentMethod === "transfer" && !transferReady)}
                   className="flex items-center gap-1.5 rounded-lg bg-brand-500 px-5 py-2 text-sm font-semibold text-white hover:bg-brand-600 disabled:opacity-60"
                 >
-                  {paymentMethod === "qris" ? <QrCodeIcon className="h-4 w-4" /> : <ReceiptIcon className="h-4 w-4" />}
-                  {submitting ? "Memproses..." : paymentMethod === "qris" ? "Buat QRIS" : "Proses Transaksi"}
+                  {paymentMethod === "qris" ? <QrCodeIcon className="h-4 w-4" />
+                    : paymentMethod === "transfer" ? <CheckCircleIcon className="h-4 w-4" />
+                    : <ReceiptIcon className="h-4 w-4" />}
+                  {submitting ? "Memproses..."
+                    : paymentMethod === "qris" ? "Buat QRIS"
+                    : paymentMethod === "transfer" ? "Bukti transfer sudah dicek"
+                    : "Proses Transaksi"}
                 </button>
               </div>
             </div>
@@ -1084,6 +1269,7 @@ const TransactionsPage = () => {
                 <label className={labelCss}>Alasan pembatalan (opsional)</label>
                 <input
                   type="text"
+                  maxLength={MAX_LEN.note}
                   value={cancelReason}
                   onChange={(e) => setCancelReason(e.target.value)}
                   placeholder="mis. pembeli batal / ganti bayar tunai"
@@ -1105,13 +1291,27 @@ const TransactionsPage = () => {
       {printTarget && (
         <div className={modalBg}>
           <div className="absolute inset-0 bg-black/50" onClick={() => setPrintTarget(null)} />
-          <div className={`relative z-50 mx-4 max-h-[90vh] overflow-y-auto rounded-2xl shadow-2xl ${isDarkMode ? "bg-gray-800" : "bg-white"}`}>
+          <div className={`relative z-50 mx-4 max-h-[90vh] w-full max-w-sm overflow-y-auto rounded-2xl shadow-2xl ${isDarkMode ? "bg-gray-800" : "bg-white"}`}>
             <div className={`flex items-center justify-between border-b px-5 py-3 ${isDarkMode ? "border-gray-700" : "border-gray-200"}`}>
               <h3 className={`text-sm font-bold ${isDarkMode ? "text-gray-100" : "text-gray-800"}`}>Struk {printTarget.transactionNumber}</h3>
               <button onClick={() => setPrintTarget(null)}><XIcon className="h-5 w-5 text-gray-400" /></button>
             </div>
-            <div className="p-4" dangerouslySetInnerHTML={{ __html: buildStrukHtml(printTarget, store) }} />
-            {printError && <p className="px-5 pb-2 text-xs text-red-500">{printError}</p>}
+            {/* Pratinjau ukuran asli kertas thermal (sama dengan hasil cetak) */}
+            <div className={`flex justify-center p-4 ${isDarkMode ? "bg-gray-900" : "bg-gray-100"}`}>
+              <div className="shadow-md" dangerouslySetInnerHTML={{ __html: buildReceiptHtml(printTarget, store) }} />
+            </div>
+            <p className="px-5 py-3 text-center text-[11px] text-gray-500 dark:text-gray-400">
+              Kertas thermal {RECEIPT_PAPER_MM} mm. Belum ada printer? Pilih <b>Save as PDF</b> di jendela cetak.
+            </p>
+            {canSendEmail && (
+              <ReceiptEmailPanel
+                key={printTarget.transactionId}
+                initial={printTarget}
+                emailReady={emailReady}
+                inputCss={inputCss}
+              />
+            )}
+            {printError && <p className="px-5 pb-3 text-xs text-red-500">{printError}</p>}
             <div className={`flex justify-end gap-2 border-t px-5 py-3 ${isDarkMode ? "border-gray-700" : "border-gray-200"}`}>
               <button onClick={() => setPrintTarget(null)} className={btnSecondary}>Tutup</button>
               <button onClick={handlePrint} className="flex items-center gap-1.5 rounded-lg bg-blue-500 px-4 py-2 text-sm text-white hover:bg-blue-600">

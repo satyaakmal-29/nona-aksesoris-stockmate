@@ -16,9 +16,20 @@ import {
 import { CameraIcon, KeyRoundIcon, LogOutIcon, ShieldIcon } from "lucide-react";
 import { getTranslation } from "@/lib/translations";
 import { compressImage } from "@/lib/imageCompress";
+import FieldError from "@/app/(components)/FieldError";
+import {
+  MAX_LEN,
+  MAX_PASSWORD,
+  PASSWORD_HINT,
+  confirmPasswordError,
+  gmailError,
+  passwordError,
+  personNameError,
+  squeeze,
+  whatsappError,
+} from "@/lib/validation";
+import { formatWhatsapp } from "@/lib/whatsapp";
 import StoreSettingsSection from "./StoreSettingsSection";
-
-const MIN_PASSWORD = 6;
 
 const getErrorMessage = (err: unknown, fallback: string) => {
   const e = err as { data?: { message?: string } };
@@ -51,6 +62,7 @@ const Settings = () => {
   const [form, setForm] = useState({
     name:         "",
     email:        "",
+    whatsapp:     "",
     profileImage: "",
   });
   const [saveStatus,        setSaveStatus]        = useState<"idle" | "success" | "error">("idle");
@@ -62,19 +74,31 @@ const Settings = () => {
   const [pwForm, setPwForm] = useState({ current: "", next: "", confirm: "" });
   const [pwMessage, setPwMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
+  // Error per kolom tampil setelah tombol ditekan, lalu diperbarui saat mengetik
+  const [showProfileErrors, setShowProfileErrors] = useState(false);
+  const [showPwErrors, setShowPwErrors]           = useState(false);
+
+  const profileErrors = {
+    name:     personNameError(form.name),
+    email:    gmailError(form.email),
+    whatsapp: whatsappError(form.whatsapp),
+  };
+  const pwErrors = {
+    current: pwForm.current ? "" : "Password lama wajib diisi",
+    next:
+      passwordError(pwForm.next, profile?.username ?? currentUser?.username, "Password baru") ||
+      (pwForm.next === pwForm.current ? "Password baru harus berbeda dari password lama" : ""),
+    confirm: confirmPasswordError(pwForm.next, pwForm.confirm),
+  };
+
   const handleChangePassword = async () => {
     setPwMessage(null);
-    if (!pwForm.current) return setPwMessage({ type: "error", text: "Password lama wajib diisi" });
-    if (pwForm.next.length < MIN_PASSWORD) {
-      return setPwMessage({ type: "error", text: `Password baru minimal ${MIN_PASSWORD} karakter` });
-    }
-    if (pwForm.next !== pwForm.confirm) return setPwMessage({ type: "error", text: "Konfirmasi password baru tidak sama" });
-    if (pwForm.next === pwForm.current) {
-      return setPwMessage({ type: "error", text: "Password baru harus berbeda dari password lama" });
-    }
+    setShowPwErrors(true);
+    if (Object.values(pwErrors).some(Boolean)) return;
     try {
       const res = await changePassword({ currentPassword: pwForm.current, newPassword: pwForm.next }).unwrap();
       setPwForm({ current: "", next: "", confirm: "" });
+      setShowPwErrors(false);
       setPwMessage({ type: "success", text: res.message });
     } catch (err) {
       setPwMessage({ type: "error", text: getErrorMessage(err, "Gagal mengganti password") });
@@ -89,6 +113,7 @@ const Settings = () => {
     setForm({
       name:         profile.name         ?? "",
       email:        profile.email        ?? "",
+      whatsapp:     profile.whatsapp ? formatWhatsapp(profile.whatsapp) : "",
       profileImage: profile.profileImage ?? "",
     });
   }
@@ -113,13 +138,14 @@ const Settings = () => {
     if (!profile) return;
     setSaveStatus("idle");
     setSaveError("");
-    if (!form.name.trim()) { setSaveError("Nama tidak boleh kosong"); return; }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) { setSaveError("Format email tidak valid"); return; }
+    setShowProfileErrors(true);
+    if (Object.values(profileErrors).some(Boolean)) return;
     try {
       const updated = await updateProfile({
         userId:       profile.userId,
-        name:         form.name.trim(),
-        email:        form.email.trim(),
+        name:         squeeze(form.name),
+        email:        form.email.trim().toLowerCase(),
+        whatsapp:     form.whatsapp.trim(), // "" = hapus; server merapikan ke format 628…
         profileImage: form.profileImage,
         language:     APP_LANGUAGE,
       }).unwrap();
@@ -172,14 +198,15 @@ const Settings = () => {
       <div className="mt-6 flex items-center justify-between gap-5 rounded-xl bg-white dark:bg-gray-800 p-5 shadow-md border border-gray-200 dark:border-gray-700">
         <div className="flex items-center gap-4">
           {/* Avatar */}
-          <div className="relative">
+          {/* Ukuran tetap + object-cover: foto tidak persegi tetap tampil bulat (dipotong tengah) */}
+          <div className="relative shrink-0">
             <Image
               src={form.profileImage || "/assets/profile.jpg"}
               alt="Profile"
               width={72}
               height={72}
               unoptimized={form.profileImage?.startsWith("data:")}
-              className="h-18 w-18 rounded-full object-cover border-2 border-gray-200 dark:border-gray-600"
+              className="h-[72px] w-[72px] rounded-full object-cover border-2 border-gray-200 dark:border-gray-600"
             />
             <button
               onClick={() => fileInputRef.current?.click()}
@@ -235,10 +262,13 @@ const Settings = () => {
               <td className="px-5 py-3">
                 <input
                   type="text"
+                  aria-label="Nama"
+                  maxLength={MAX_LEN.personName}
                   value={form.name}
                   onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
-                  className={inputCss}
+                  className={`${inputCss} ${showProfileErrors && profileErrors.name ? "border-red-400 dark:border-red-500" : ""}`}
                 />
+                <FieldError message={showProfileErrors ? profileErrors.name : ""} />
               </td>
             </tr>
             <tr className="hover:bg-blue-50 dark:hover:bg-gray-700/50 transition-colors">
@@ -248,10 +278,36 @@ const Settings = () => {
               <td className="px-5 py-3">
                 <input
                   type="email"
+                  inputMode="email"
+                  aria-label="Email"
+                  placeholder="nama@gmail.com"
+                  maxLength={MAX_LEN.email}
                   value={form.email}
                   onChange={(e) => setForm((p) => ({ ...p, email: e.target.value }))}
-                  className={inputCss}
+                  className={`${inputCss} ${showProfileErrors && profileErrors.email ? "border-red-400 dark:border-red-500" : ""}`}
                 />
+                <FieldError message={showProfileErrors ? profileErrors.email : ""} />
+              </td>
+            </tr>
+            <tr className="hover:bg-blue-50 dark:hover:bg-gray-700/50 transition-colors">
+              <td className="px-5 py-3 text-sm text-gray-700 dark:text-gray-300 font-medium">
+                Nomor WhatsApp
+              </td>
+              <td className="px-5 py-3">
+                <input
+                  type="tel"
+                  inputMode="tel"
+                  aria-label="Nomor WhatsApp"
+                  placeholder="0812 3456 7890"
+                  maxLength={20}
+                  value={form.whatsapp}
+                  onChange={(e) => setForm((p) => ({ ...p, whatsapp: e.target.value }))}
+                  className={`${inputCss} ${showProfileErrors && profileErrors.whatsapp ? "border-red-400 dark:border-red-500" : ""}`}
+                />
+                <FieldError message={showProfileErrors ? profileErrors.whatsapp : ""} />
+                <p className="mt-1 text-[11px] text-gray-400">
+                  Opsional. Dipakai rekan kerja untuk mengirim notifikasi Purchase Order & Store Replenishment lewat WhatsApp.
+                </p>
               </td>
             </tr>
             <tr className="hover:bg-blue-50 dark:hover:bg-gray-700/50 transition-colors">
@@ -302,35 +358,47 @@ const Settings = () => {
         </div>
         <div className="grid max-w-md gap-3">
           <div>
-            <label className="mb-1 block text-sm text-gray-600 dark:text-gray-300">Password lama</label>
+            <label htmlFor="pw-current" className="mb-1 block text-sm text-gray-600 dark:text-gray-300">Password lama</label>
             <input
+              id="pw-current"
               type="password"
               autoComplete="current-password"
+              maxLength={MAX_PASSWORD}
               value={pwForm.current}
               onChange={(e) => setPwForm((p) => ({ ...p, current: e.target.value }))}
-              className={inputCss}
+              className={`${inputCss} ${showPwErrors && pwErrors.current ? "border-red-400 dark:border-red-500" : ""}`}
             />
+            <FieldError message={showPwErrors ? pwErrors.current : ""} />
           </div>
           <div>
-            <label className="mb-1 block text-sm text-gray-600 dark:text-gray-300">Password baru</label>
+            <label htmlFor="pw-next" className="mb-1 block text-sm text-gray-600 dark:text-gray-300">Password baru</label>
             <input
+              id="pw-next"
               type="password"
               autoComplete="new-password"
-              placeholder={`Minimal ${MIN_PASSWORD} karakter`}
+              maxLength={MAX_PASSWORD}
               value={pwForm.next}
               onChange={(e) => setPwForm((p) => ({ ...p, next: e.target.value }))}
-              className={inputCss}
+              className={`${inputCss} ${showPwErrors && pwErrors.next ? "border-red-400 dark:border-red-500" : ""}`}
             />
+            {showPwErrors && pwErrors.next ? (
+              <FieldError message={pwErrors.next} />
+            ) : (
+              <p className="mt-1 text-xs text-gray-400">{PASSWORD_HINT}</p>
+            )}
           </div>
           <div>
-            <label className="mb-1 block text-sm text-gray-600 dark:text-gray-300">Ulangi password baru</label>
+            <label htmlFor="pw-confirm" className="mb-1 block text-sm text-gray-600 dark:text-gray-300">Ulangi password baru</label>
             <input
+              id="pw-confirm"
               type="password"
               autoComplete="new-password"
+              maxLength={MAX_PASSWORD}
               value={pwForm.confirm}
               onChange={(e) => setPwForm((p) => ({ ...p, confirm: e.target.value }))}
-              className={inputCss}
+              className={`${inputCss} ${showPwErrors && pwErrors.confirm ? "border-red-400 dark:border-red-500" : ""}`}
             />
+            <FieldError message={showPwErrors ? pwErrors.confirm : ""} />
           </div>
         </div>
         <div className="mt-4 flex flex-wrap items-center gap-3">

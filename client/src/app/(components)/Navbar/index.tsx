@@ -124,6 +124,8 @@ const REFERENCE_LINKS: Record<string, { href: string; label: string }> = {
 // Jumlah notifikasi terbaru di dropdown lonceng (sisanya lewat "Lihat semua")
 const DROPDOWN_LIMIT = 8;
 
+const MARK_READ_ERROR = "Gagal menandai notifikasi sebagai dibaca. Periksa koneksi ke server lalu coba lagi.";
+
 // ── Helper waktu (tanggal LOKAL) ──────────────────────────────────
 const pad = (n: number) => String(n).padStart(2, "0");
 const localDayKey = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -246,6 +248,7 @@ const Navbar = () => {
   const [selectedNotif, setSelectedNotif] = useState<Notification | null>(null);
   // Detail dibuka dari modal "Semua Notifikasi" → tombol Kembali ke daftar
   const [detailFromAll, setDetailFromAll] = useState(false);
+  const [notifError, setNotifError] = useState("");
 
   // Waktu acuan untuk "x menit lalu", diperbarui tiap menit
   const [now, setNow] = useState(() => Date.now());
@@ -300,8 +303,10 @@ const Navbar = () => {
   const handleSearch = (e: React.ChangeEvent<HTMLInputElement>) =>
     dispatch(setSearchTerm(e.target.value));
 
+  // Badge langsung turun (optimistic di api.ts); jika server gagal, badge kembali + pesan error
   const markAllAsRead = () => {
-    markAllNotificationsAsRead();
+    setNotifError("");
+    markAllNotificationsAsRead().unwrap().catch(() => setNotifError(MARK_READ_ERROR));
   };
 
   // Buka detail (dari dropdown atau modal semua); tandai dibaca
@@ -311,7 +316,8 @@ const Navbar = () => {
     setIsNotifOpen(false);
     setIsAllOpen(false);
     if (!notif.isRead) {
-      markNotificationAsRead(notif.notifId);
+      setNotifError("");
+      markNotificationAsRead(notif.notifId).unwrap().catch(() => setNotifError(MARK_READ_ERROR));
     }
   };
 
@@ -344,6 +350,26 @@ const Navbar = () => {
       : undefined;
 
   const badgeText = unreadCount > 99 ? "99+" : String(unreadCount);
+
+  // Tombol "Baca semua" selalu tampil (nonaktif jika tidak ada yang belum dibaca)
+  const readAllButton = (
+    <button
+      type="button"
+      onClick={markAllAsRead}
+      disabled={unreadCount === 0}
+      title={unreadCount === 0 ? "Semua notifikasi sudah dibaca" : `Tandai ${unreadCount} notifikasi sebagai dibaca`}
+      className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-brand-500 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-brand-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400 disabled:shadow-none dark:disabled:bg-gray-700 dark:disabled:text-gray-500"
+    >
+      <CheckCheck className="h-3.5 w-3.5" />
+      {t.markAllRead}
+    </button>
+  );
+
+  const errorLine = notifError && (
+    <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/30 dark:text-red-300">
+      {notifError}
+    </p>
+  );
 
   return (
     <>
@@ -388,10 +414,11 @@ const Navbar = () => {
               </p>
             </div>
 
-            <div className="px-6 py-5">
+            <div className="space-y-3 px-6 py-5">
               <p className="whitespace-pre-line text-sm leading-relaxed text-gray-700 dark:text-gray-200">
                 {selectedNotif.message}
               </p>
+              {errorLine}
             </div>
 
             <div className="flex flex-wrap justify-end gap-2 border-t border-gray-100 px-6 py-4 dark:border-gray-700">
@@ -483,16 +510,9 @@ const Navbar = () => {
                         {unreadCount > 0 ? `${unreadCount} belum dibaca` : "Semua sudah dibaca"}
                       </p>
                     </div>
-                    {unreadCount > 0 && (
-                      <button
-                        onClick={markAllAsRead}
-                        className="inline-flex shrink-0 items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold text-brand-600 transition-colors hover:bg-brand-50 dark:text-brand-300 dark:hover:bg-brand-500/10"
-                      >
-                        <CheckCheck className="h-3.5 w-3.5" />
-                        {t.markAllRead}
-                      </button>
-                    )}
+                    {readAllButton}
                   </div>
+                  {notifError && <div className="px-4 pb-3">{errorLine}</div>}
 
                   <div className={`max-h-[22rem] space-y-1 overflow-y-auto border-t border-gray-100 px-2 py-2 dark:border-gray-700 ${slimScroll}`}>
                     {notifications.length === 0 ? (
@@ -510,9 +530,6 @@ const Navbar = () => {
                       className="group flex w-full items-center justify-center gap-1.5 rounded-xl bg-brand-50 py-2.5 text-sm font-semibold text-brand-700 ring-1 ring-brand-100 transition-colors hover:bg-brand-100 hover:ring-brand-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 dark:bg-brand-500/10 dark:text-brand-300 dark:ring-brand-500/20 dark:hover:bg-brand-500/20"
                     >
                       {t.viewAll}
-                      {notifications.length > 0 && (
-                        <span className="font-normal text-brand-500 dark:text-brand-400">({notifications.length})</span>
-                      )}
                       <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
                     </button>
                   </div>
@@ -533,7 +550,7 @@ const Navbar = () => {
                 width={50}
                 height={50}
                 unoptimized={profile?.profileImage?.startsWith("data:") ?? false}
-                className="h-10 w-10 rounded-full object-cover"
+                className="h-10 w-10 shrink-0 rounded-full object-cover"
               />
               <span className="font-semibold dark:text-gray-100">
                 {profile?.name || "User"}
@@ -567,16 +584,8 @@ const Navbar = () => {
                   {unreadCount > 0 ? `${unreadCount} belum dibaca` : "Semua sudah dibaca"} · {notifications.length} notifikasi terbaru
                 </p>
               </div>
-              <div className="flex shrink-0 items-center gap-1">
-                {unreadCount > 0 && (
-                  <button
-                    onClick={markAllAsRead}
-                    className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold text-brand-600 transition-colors hover:bg-brand-50 dark:text-brand-300 dark:hover:bg-brand-500/10"
-                  >
-                    <CheckCheck className="h-3.5 w-3.5" />
-                    {t.markAllRead}
-                  </button>
-                )}
+              <div className="flex shrink-0 items-center gap-2">
+                {readAllButton}
                 <button
                   onClick={() => setIsAllOpen(false)}
                   aria-label="Tutup"
@@ -587,13 +596,16 @@ const Navbar = () => {
               </div>
             </div>
 
-            {/* Tab Semua / Belum dibaca */}
+            {notifError && <div className="px-6 pb-3">{errorLine}</div>}
+
+            {/* Tab Semua / Belum dibaca — angka hanya untuk yang BELUM dibaca
+                (angka total dulu terlihat seperti badge yang tidak hilang) */}
             <div className="px-6 pb-3">
               <div className="inline-flex rounded-xl bg-gray-100 p-1 dark:bg-gray-700/60">
                 {([
-                  ["all", "Semua", notifications.length],
-                  ["unread", "Belum dibaca", unreadInList],
-                ] as const).map(([key, label, count]) => (
+                  ["all", "Semua"],
+                  ["unread", "Belum dibaca"],
+                ] as const).map(([key, label]) => (
                   <button
                     key={key}
                     onClick={() => setAllTab(key)}
@@ -604,13 +616,11 @@ const Navbar = () => {
                     }`}
                   >
                     {label}
-                    <span
-                      className={`rounded-full px-1.5 py-px text-[10px] ${
-                        allTab === key ? "bg-brand-100 text-brand-700 dark:bg-brand-500/20 dark:text-brand-300" : "bg-gray-200 text-gray-600 dark:bg-gray-600 dark:text-gray-300"
-                      }`}
-                    >
-                      {count}
-                    </span>
+                    {key === "unread" && unreadInList > 0 && (
+                      <span className="rounded-full bg-red-500 px-1.5 py-px text-[10px] font-bold text-white">
+                        {unreadInList}
+                      </span>
+                    )}
                   </button>
                 ))}
               </div>

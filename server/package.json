@@ -9,7 +9,7 @@
     "resync-stock": "ts-node src/scripts/resyncStock.ts",
     "build": "rimraf dist && npx tsc",
     "start": "npm run build && node dist/index.js",
-    "dev": "npm run build && concurrently \"npx tsc -w\" \"nodemon --exec ts-node src/index.ts\""
+    "dev": "concurrently \"tsc -w --noEmit --preserveWatchOutput\" \"nodemon --watch src --ext ts,json --exec ts-node --transpile-only src/index.ts\""
   },
   "keywords": [],
   "author": "",
@@ -27,6 +27,7 @@
     "express-session": "^1.19.0",
     "helmet": "^8.1.0",
     "morgan": "^1.10.1",
+    "nodemailer": "^10.1.7",
     "pg": "^8.21.0",
     "prisma": "^7.8.0",
     "rimraf": "^6.1.3",

@@ -3,8 +3,21 @@
 import { useState } from "react";
 import Image from "next/image";
 import Header from "@/app/(components)/Header";
+import FieldError from "@/app/(components)/FieldError";
 import ProofImageInput, { ProofImageView } from "@/app/(components)/ProofImageInput";
+import WhatsAppNotifyModal from "@/app/(components)/WhatsAppNotify";
 import { useAppSelector } from "@/app/redux";
+import { PO_SENDER_ROLE, WaNotice, buildPoNotice } from "@/lib/whatsapp";
+import {
+  MAX_LEN,
+  QTY_MAX,
+  docNumberError,
+  optionalTextError,
+  priceError,
+  qtyError,
+  requiredTextError,
+  squeeze,
+} from "@/lib/validation";
 import {
   useGetPurchaseOrdersQuery,
   useGetPurchaseOrderByIdQuery,
@@ -21,6 +34,7 @@ import {
   ChevronUpIcon,
   ClockIcon,
   ImageIcon,
+  MessageCircleIcon,
   PackageIcon,
   PlusCircleIcon,
   ShoppingCartIcon,
@@ -70,15 +84,20 @@ const getErrorMessage = (err: unknown, fallback: string) => {
 // Selisih total nota vs total item yang masih ditoleransi server
 const TOTAL_TOLERANCE = 0.5;
 
+const CHECK_FIELDS = "Periksa kembali isian yang ditandai merah.";
+
 // ── Input harga Rupiah (hanya angka, titik ribuan otomatis) ───────
+// maxDigits: harga beli satuan maks 9 digit (Rp 100.000.000)
 const PriceInput = ({
   value,
   onChange,
   className,
+  maxDigits = 13,
 }: {
   value: number;
   onChange: (n: number) => void;
   className: string;
+  maxDigits?: number;
 }) => (
   <div className="relative">
     <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-gray-400">
@@ -90,7 +109,7 @@ const PriceInput = ({
       value={value ? value.toLocaleString("id-ID") : ""}
       placeholder="0"
       onChange={(e) => {
-        const digits = e.target.value.replace(/\D/g, "");
+        const digits = e.target.value.replace(/\D/g, "").slice(0, maxDigits);
         onChange(digits ? Number(digits) : 0);
       }}
       className={`${className} pl-9`}
@@ -197,12 +216,14 @@ const POCard = ({
   isDarkMode,
   onReceive,
   onViewProof,
+  onSendWa,
 }: {
   po: PurchaseOrder;
   role: string;
   isDarkMode: boolean;
   onReceive: (po: PurchaseOrder) => void;
   onViewProof: (po: PurchaseOrder) => void;
+  onSendWa: (po: PurchaseOrder) => void;
 }) => {
   const [expanded, setExpanded] = useState(false);
 
@@ -286,6 +307,15 @@ const POCard = ({
                 className="flex items-center gap-1.5 rounded-lg bg-green-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-green-600"
               >
                 <CheckCircleIcon className="h-3.5 w-3.5" /> Validasi Penerimaan
+              </button>
+            )}
+            {/* Kirim ulang info tahap terakhir via WhatsApp (oleh peran yang melakukan tahap itu) */}
+            {PO_SENDER_ROLE[po.status] === role && (
+              <button
+                onClick={() => onSendWa(po)}
+                className="flex items-center gap-1.5 rounded-lg bg-green-50 px-3 py-1.5 text-xs font-semibold text-green-700 hover:bg-green-100 dark:bg-green-900/30 dark:text-green-300 dark:hover:bg-green-900/50"
+              >
+                <MessageCircleIcon className="h-3.5 w-3.5" /> Kirim via WA
               </button>
             )}
           </div>
@@ -373,6 +403,8 @@ const PurchaseOrdersPage = () => {
   const [modalError, setModalError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [proofTarget, setProofTarget] = useState<string | null>(null);
+  // Setelah PO dibuat / diterima: tawarkan kirim notifikasi via WhatsApp
+  const [waNotice, setWaNotice] = useState<WaNotice | null>(null);
 
   // ── Form buat PO ──
   const [isCreateOpen, setIsCreateOpen] = useState(false);
@@ -392,6 +424,28 @@ const PurchaseOrdersPage = () => {
   const [deliveryNoteNumber, setDeliveryNoteNumber] = useState("");
   const [receiveNotes, setReceiveNotes] = useState("");
 
+  // Error per kolom tampil setelah tombol simpan ditekan, lalu diperbarui saat mengetik
+  const [showErrors, setShowErrors] = useState(false);
+  const shown = (msg: string) => (showErrors ? msg : "");
+
+  const poErrors = {
+    supplier:       requiredTextError(supplier, "Nama supplier", 2, MAX_LEN.supplier),
+    invoiceNumber:  docNumberError(invoiceNumber, "Nomor nota / invoice"),
+    trackingNumber: docNumberError(trackingNumber, "Nomor resi / pengiriman"),
+    invoiceDate:    !invoiceDate ? "Tanggal nota wajib diisi"
+      : invoiceDate > todayISO() ? "Tanggal nota tidak boleh di masa depan" : "",
+    invoiceTotal:   invoiceTotal > 0 ? "" : "Total nota harus lebih dari 0",
+    notes:          optionalTextError(poNotes, "Catatan", MAX_LEN.note),
+  };
+  const poItemErrors = poItems.map((it) => ({
+    qty:  qtyError(it.qtyOrdered, "Jumlah"),
+    cost: priceError(it.unitCost, "Harga beli"),
+  }));
+  const receiveErrors = {
+    deliveryNoteNumber: deliveryNoteNumber.trim() ? docNumberError(deliveryNoteNumber, "Nomor surat jalan") : "",
+    notes:              optionalTextError(receiveNotes, "Catatan", MAX_LEN.note),
+  };
+
   const addItem = () => setPoItems((p) => [...p, emptyItem()]);
   const removeItem = (i: number) =>
     setPoItems((p) => p.filter((_, idx) => idx !== i));
@@ -403,6 +457,7 @@ const PurchaseOrdersPage = () => {
 
   const openCreate = () => {
     setModalError("");
+    setShowErrors(false);
     setSupplier("");
     setInvoiceNumber("");
     setTrackingNumber("");
@@ -416,6 +471,7 @@ const PurchaseOrdersPage = () => {
 
   const openReceive = (po: PurchaseOrder) => {
     setModalError("");
+    setShowErrors(false);
     setReceiptImage(null);
     setDeliveryNoteNumber("");
     setReceiveNotes("");
@@ -433,13 +489,9 @@ const PurchaseOrdersPage = () => {
 
   const handleCreatePO = async () => {
     setModalError("");
+    setShowErrors(true);
 
-    if (!supplier.trim()) return setModalError("Nama supplier wajib diisi");
-    if (!invoiceNumber.trim()) return setModalError("Nomor nota / invoice wajib diisi");
-    if (!trackingNumber.trim()) return setModalError("Nomor resi / pengiriman wajib diisi");
-    if (!invoiceDate) return setModalError("Tanggal nota wajib diisi");
-    if (invoiceDate > todayISO()) return setModalError("Tanggal nota tidak boleh di masa depan");
-    if (!(invoiceTotal > 0)) return setModalError("Total nota harus lebih dari 0");
+    if (Object.values(poErrors).some(Boolean)) return setModalError(CHECK_FIELDS);
     if (!invoiceImage) return setModalError("Foto nota wajib diunggah");
 
     for (let i = 0; i < poItems.length; i++) {
@@ -450,12 +502,7 @@ const PurchaseOrdersPage = () => {
       if (activeVariants.length > 0 && !it.variantId) {
         return setModalError(`Item ${i + 1}: pilih varian untuk "${p.name}"`);
       }
-      if (!Number.isInteger(it.qtyOrdered) || it.qtyOrdered < 1) {
-        return setModalError(`Item ${i + 1}: jumlah minimal 1`);
-      }
-      if (!(it.unitCost > 0)) {
-        return setModalError(`Item ${i + 1}: harga beli satuan harus lebih dari 0`);
-      }
+      if (poItemErrors[i].qty || poItemErrors[i].cost) return setModalError(CHECK_FIELDS);
     }
 
     if (totalMismatch) {
@@ -467,13 +514,13 @@ const PurchaseOrdersPage = () => {
     setSubmitting(true);
     try {
       const payload: NewPurchaseOrder = {
-        supplier: supplier.trim(),
+        supplier: squeeze(supplier),
         invoiceNumber: invoiceNumber.trim(),
         trackingNumber: trackingNumber.trim(),
         invoiceDate,
         invoiceTotal,
         invoiceImage,
-        notes: poNotes.trim() || undefined,
+        notes: squeeze(poNotes) || undefined,
         items: poItems.map((i) => ({
           productId: i.productId,
           variantId: i.variantId || undefined,
@@ -481,8 +528,9 @@ const PurchaseOrdersPage = () => {
           unitCost: i.unitCost,
         })),
       };
-      await createPO(payload).unwrap();
+      const created = await createPO(payload).unwrap();
       setIsCreateOpen(false);
+      setWaNotice(buildPoNotice(created));
     } catch (err: unknown) {
       setModalError(getErrorMessage(err, "Gagal membuat Purchase Order"));
     } finally {
@@ -493,6 +541,8 @@ const PurchaseOrdersPage = () => {
   const handleReceive = async () => {
     if (!receiveTarget) return;
     setModalError("");
+    setShowErrors(true);
+    if (Object.values(receiveErrors).some(Boolean)) return setModalError(CHECK_FIELDS);
 
     for (const item of receiveTarget.Items) {
       const row = receiveRows[item.poItemId];
@@ -505,6 +555,9 @@ const PurchaseOrdersPage = () => {
       if (row.qty < item.qtyOrdered && !row.note.trim()) {
         return setModalError(`${label}: isi alasan karena diterima kurang dari jumlah dipesan`);
       }
+      if (squeeze(row.note).length > MAX_LEN.note) {
+        return setModalError(`${label}: alasan maksimal ${MAX_LEN.note} karakter`);
+      }
     }
     if (receiveTarget.Items.every((item) => receiveRows[item.poItemId].qty === 0)) {
       return setModalError("Tidak ada barang yang diterima");
@@ -513,21 +566,22 @@ const PurchaseOrdersPage = () => {
 
     setSubmitting(true);
     try {
-      await receivePO({
+      const received = await receivePO({
         poId: receiveTarget.poId,
         receiptImage,
         deliveryNoteNumber: deliveryNoteNumber.trim() || undefined,
-        receiveNotes: receiveNotes.trim() || undefined,
+        receiveNotes: squeeze(receiveNotes) || undefined,
         receivedItems: receiveTarget.Items.map((item) => {
           const row = receiveRows[item.poItemId];
           return {
             poItemId: item.poItemId,
             qtyReceived: row.qty,
-            receiveNote: row.note.trim() || undefined,
+            receiveNote: squeeze(row.note) || undefined,
           };
         }),
       }).unwrap();
       setReceiveTarget(null);
+      setWaNotice(buildPoNotice(received));
     } catch (err: unknown) {
       setModalError(getErrorMessage(err, "Gagal memvalidasi penerimaan"));
     } finally {
@@ -545,6 +599,7 @@ const PurchaseOrdersPage = () => {
       : "border-gray-300 bg-white text-gray-900"
   }`;
   const labelCss = "mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300";
+  const errCss = (msg: string) => (msg ? "!border-red-400" : "");
   const btnSecondary = `px-4 py-2 rounded-lg text-sm ${
     isDarkMode
       ? "bg-gray-700 text-gray-200 hover:bg-gray-600"
@@ -613,6 +668,7 @@ const PurchaseOrdersPage = () => {
             isDarkMode={isDarkMode}
             onReceive={openReceive}
             onViewProof={(p) => setProofTarget(p.poId)}
+            onSendWa={(p) => setWaNotice(buildPoNotice(p))}
           />
         ))
       ) : (
@@ -645,16 +701,20 @@ const PurchaseOrdersPage = () => {
             <p className="mb-2 text-sm font-semibold text-gray-700 dark:text-gray-300">
               Bukti Pembelian
             </p>
-            <label className={labelCss}>
-              Nama Supplier<span className="ml-0.5 text-red-500">*</span>
-            </label>
-            <input
-              type="text"
-              value={supplier}
-              onChange={(e) => setSupplier(e.target.value)}
-              placeholder="contoh: CV Sumber Wangi"
-              className={`${inputCss} mb-3`}
-            />
+            <div className="mb-3">
+              <label className={labelCss}>
+                Nama Supplier<span className="ml-0.5 text-red-500">*</span>
+              </label>
+              <input
+                type="text"
+                maxLength={MAX_LEN.supplier}
+                value={supplier}
+                onChange={(e) => setSupplier(e.target.value)}
+                placeholder="contoh: CV Sumber Wangi"
+                className={`${inputCss} ${errCss(shown(poErrors.supplier))}`}
+              />
+              <FieldError message={shown(poErrors.supplier)} />
+            </div>
 
             <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
@@ -663,11 +723,13 @@ const PurchaseOrdersPage = () => {
                 </label>
                 <input
                   type="text"
+                  maxLength={MAX_LEN.docNumber}
                   value={invoiceNumber}
-                  onChange={(e) => setInvoiceNumber(e.target.value)}
+                  onChange={(e) => setInvoiceNumber(e.target.value.replace(/\s/g, ""))}
                   placeholder="contoh: INV-0012"
-                  className={inputCss}
+                  className={`${inputCss} ${errCss(shown(poErrors.invoiceNumber))}`}
                 />
+                <FieldError message={shown(poErrors.invoiceNumber)} />
               </div>
               <div>
                 <label className={labelCss}>
@@ -675,11 +737,13 @@ const PurchaseOrdersPage = () => {
                 </label>
                 <input
                   type="text"
+                  maxLength={MAX_LEN.docNumber}
                   value={trackingNumber}
-                  onChange={(e) => setTrackingNumber(e.target.value)}
+                  onChange={(e) => setTrackingNumber(e.target.value.replace(/\s/g, ""))}
                   placeholder="contoh: JNE123456789"
-                  className={inputCss}
+                  className={`${inputCss} ${errCss(shown(poErrors.trackingNumber))}`}
                 />
+                <FieldError message={shown(poErrors.trackingNumber)} />
               </div>
               <div>
                 <label className={labelCss}>
@@ -690,16 +754,21 @@ const PurchaseOrdersPage = () => {
                   value={invoiceDate}
                   max={todayISO()}
                   onChange={(e) => setInvoiceDate(e.target.value)}
-                  className={inputCss}
+                  className={`${inputCss} ${errCss(shown(poErrors.invoiceDate))}`}
                 />
+                <FieldError message={shown(poErrors.invoiceDate)} />
               </div>
               <div>
                 <label className={labelCss}>
                   Total di Nota<span className="ml-0.5 text-red-500">*</span>
                 </label>
-                <PriceInput value={invoiceTotal} onChange={setInvoiceTotal} className={inputCss} />
+                <PriceInput value={invoiceTotal} onChange={setInvoiceTotal} className={`${inputCss} ${errCss(shown(poErrors.invoiceTotal))}`} />
+                <FieldError message={shown(poErrors.invoiceTotal)} />
               </div>
             </div>
+            <p className="-mt-1 mb-3 text-xs text-gray-400">
+              Nomor nota & resi: 3–50 karakter, hanya huruf, angka, &quot;-&quot;, &quot;/&quot;, atau &quot;.&quot; (tanpa spasi).
+            </p>
 
             <ProofImageInput
               label="Foto Nota"
@@ -711,14 +780,18 @@ const PurchaseOrdersPage = () => {
               hint="Pastikan nomor nota dan total terbaca jelas."
             />
 
-            <label className={labelCss}>Catatan (opsional)</label>
-            <textarea
-              value={poNotes}
-              onChange={(e) => setPoNotes(e.target.value)}
-              placeholder="Catatan tambahan untuk PO ini..."
-              rows={2}
-              className={`${inputCss} mb-4 resize-none`}
-            />
+            <div className="mb-4">
+              <label className={labelCss}>Catatan (opsional)</label>
+              <textarea
+                maxLength={MAX_LEN.note}
+                value={poNotes}
+                onChange={(e) => setPoNotes(e.target.value)}
+                placeholder="Catatan tambahan untuk PO ini..."
+                rows={2}
+                className={`${inputCss} resize-none ${errCss(shown(poErrors.notes))}`}
+              />
+              <FieldError message={shown(poErrors.notes)} />
+            </div>
 
             {/* Item */}
             <div className="mb-2 flex items-center justify-between">
@@ -797,21 +870,25 @@ const PurchaseOrdersPage = () => {
                         <input
                           type="number"
                           min={1}
+                          max={QTY_MAX}
                           step={1}
                           value={item.qtyOrdered}
                           onChange={(e) =>
-                            patchItem(i, { qtyOrdered: Math.floor(Number(e.target.value)) })
+                            patchItem(i, { qtyOrdered: Math.min(QTY_MAX, Math.floor(Number(e.target.value))) })
                           }
-                          className={inputCss}
+                          className={`${inputCss} ${errCss(shown(poItemErrors[i].qty))}`}
                         />
+                        <FieldError message={shown(poItemErrors[i].qty)} />
                       </div>
                       <div>
                         <label className="mb-1 block text-xs text-gray-500">Harga Beli Satuan</label>
                         <PriceInput
                           value={item.unitCost}
                           onChange={(n) => patchItem(i, { unitCost: n })}
-                          className={inputCss}
+                          maxDigits={9}
+                          className={`${inputCss} ${errCss(shown(poItemErrors[i].cost))}`}
                         />
+                        <FieldError message={shown(poItemErrors[i].cost)} />
                       </div>
                     </div>
                     {item.unitCost > 0 && item.qtyOrdered > 0 && (
@@ -925,6 +1002,7 @@ const PurchaseOrdersPage = () => {
                     {short && (
                       <input
                         type="text"
+                        maxLength={MAX_LEN.note}
                         value={row.note}
                         onChange={(e) => patchReceiveRow(item.poItemId, { note: e.target.value })}
                         placeholder="Alasan kurang (wajib), mis. 2 botol pecah"
@@ -936,14 +1014,18 @@ const PurchaseOrdersPage = () => {
               })}
             </div>
 
-            <label className={labelCss}>No. Surat Jalan (opsional)</label>
-            <input
-              type="text"
-              value={deliveryNoteNumber}
-              onChange={(e) => setDeliveryNoteNumber(e.target.value)}
-              placeholder="Nomor surat jalan dari supplier/kurir"
-              className={`${inputCss} mb-3`}
-            />
+            <div className="mb-3">
+              <label className={labelCss}>No. Surat Jalan (opsional)</label>
+              <input
+                type="text"
+                maxLength={MAX_LEN.docNumber}
+                value={deliveryNoteNumber}
+                onChange={(e) => setDeliveryNoteNumber(e.target.value.replace(/\s/g, ""))}
+                placeholder="Nomor surat jalan dari supplier/kurir"
+                className={`${inputCss} ${errCss(shown(receiveErrors.deliveryNoteNumber))}`}
+              />
+              <FieldError message={shown(receiveErrors.deliveryNoteNumber)} />
+            </div>
 
             <ProofImageInput
               label="Foto Bukti Penerimaan"
@@ -955,14 +1037,18 @@ const PurchaseOrdersPage = () => {
               hint="Foto barang yang diterima beserta nota/surat jalan."
             />
 
-            <label className={labelCss}>Catatan (opsional)</label>
-            <textarea
-              value={receiveNotes}
-              onChange={(e) => setReceiveNotes(e.target.value)}
-              placeholder="Catatan penerimaan..."
-              rows={2}
-              className={`${inputCss} mb-4 resize-none`}
-            />
+            <div className="mb-4">
+              <label className={labelCss}>Catatan (opsional)</label>
+              <textarea
+                maxLength={MAX_LEN.note}
+                value={receiveNotes}
+                onChange={(e) => setReceiveNotes(e.target.value)}
+                placeholder="Catatan penerimaan..."
+                rows={2}
+                className={`${inputCss} resize-none ${errCss(shown(receiveErrors.notes))}`}
+              />
+              <FieldError message={shown(receiveErrors.notes)} />
+            </div>
 
             <div className="flex justify-end gap-2">
               <button onClick={() => setReceiveTarget(null)} className={btnSecondary}>
@@ -979,6 +1065,9 @@ const PurchaseOrdersPage = () => {
           </div>
         </div>
       )}
+
+      {/* ── MODAL KIRIM VIA WHATSAPP ─────────────────────────── */}
+      {waNotice && <WhatsAppNotifyModal notice={waNotice} onClose={() => setWaNotice(null)} />}
     </div>
   );
 };

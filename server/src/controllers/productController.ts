@@ -2,13 +2,53 @@ import { Request, Response } from "express";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { v4 as uuidv4 } from "uuid";
+import { BusinessError, sendError } from "../lib/stockHelpers";
+import {
+  PRICE_MAX,
+  QTY_MAX,
+  formatLimit,
+  isValidPrice,
+  isValidStock,
+  optionalText,
+  requiredText,
+  squeeze,
+} from "../lib/validation";
 
 // ─── Helper validasi ────────────────────────────────────────────
-const isValidPrice = (v: unknown): v is number =>
-  typeof v === "number" && Number.isFinite(v) && v >= 0;
+// Kategori dirapikan: pakai penulisan kategori yang sudah ada (tidak peka huruf besar),
+// kategori baru → huruf awal tiap kata kapital ("kalung emas" → "Kalung Emas")
+const normalizeCategory = async (v: unknown): Promise<string | null> => {
+  const s = optionalText(v, "Kategori", 40);
+  if (!s) return null;
+  const existing = await prisma.products.findFirst({
+    where:  { isActive: true, category: { equals: s, mode: "insensitive" } },
+    select: { category: true },
+  });
+  return existing?.category ?? s.replace(/(^|\s)(\p{L})/gu, (_m, sp: string, ch: string) => sp + ch.toUpperCase());
+};
 
-const isValidStock = (v: unknown): v is number =>
-  typeof v === "number" && Number.isInteger(v) && v >= 0;
+// Nama produk aktif tidak boleh kembar (tidak peka huruf besar)
+const assertUniqueProductName = async (name: string, excludeProductId?: string) => {
+  const duplicate = await prisma.products.findFirst({
+    where: {
+      isActive: true,
+      name: { equals: name, mode: "insensitive" },
+      ...(excludeProductId ? { productId: { not: excludeProductId } } : {}),
+    },
+    select: { name: true },
+  });
+  if (duplicate) throw new BusinessError(`Produk "${duplicate.name}" sudah ada. Gunakan nama lain.`);
+};
+
+// Nama varian dalam satu produk tidak boleh kembar
+const assertUniqueVariantNames = (names: string[]) => {
+  const seen = new Set<string>();
+  for (const n of names) {
+    const key = n.toLowerCase();
+    if (seen.has(key)) throw new BusinessError(`Nama varian "${n}" dipakai lebih dari sekali`);
+    seen.add(key);
+  }
+};
 
 // Nilai bawaan agar kolom type/value di database tetap terisi
 const DEFAULT_VARIANT_TYPE  = "Ukuran";
@@ -26,13 +66,17 @@ type VariantInput = {
 
 // Mengembalikan pesan error, atau null jika varian valid
 const validateVariant = (v: Partial<VariantInput>): string | null => {
-  if (!v.name?.toString().trim()) return "Nama varian wajib diisi";
+  const name = squeeze(v.name);
+  if (!name) return "Nama varian wajib diisi";
+  if (name.length > 50) return "Nama varian maksimal 50 karakter";
+  if (squeeze(v.value).length > 30) return "Ukuran maksimal 30 karakter";
+  if (squeeze(v.type).length > 30) return "Jenis ukuran maksimal 30 karakter";
   if (v.price === undefined || v.price === null) return "Harga varian wajib diisi";
-  if (!isValidPrice(v.price)) return "Harga varian harus berupa angka 0 atau lebih";
+  if (!isValidPrice(v.price)) return `Harga varian harus Rp 1 – Rp ${formatLimit(PRICE_MAX)} (tanpa desimal)`;
   if (v.stockGudang !== undefined && !isValidStock(v.stockGudang))
-    return "Stok gudang varian harus bilangan bulat 0 atau lebih";
+    return `Stok gudang varian harus bilangan bulat 0 – ${formatLimit(QTY_MAX)}`;
   if (v.stockToko !== undefined && !isValidStock(v.stockToko))
-    return "Stok toko varian harus bilangan bulat 0 atau lebih";
+    return `Stok toko varian harus bilangan bulat 0 – ${formatLimit(QTY_MAX)}`;
   return null;
 };
 
@@ -127,21 +171,18 @@ export const createProduct = async (req: Request, res: Response): Promise<void> 
     };
 
     // ── Validasi ──
-    if (!name || !name.toString().trim()) {
-      res.status(400).json({ message: "Nama produk wajib diisi" });
-      return;
-    }
+    const productName = requiredText(name, "Nama produk", 3, 100);
+    const cleanDescription = optionalText(description, "Deskripsi", 500);
     if (!Array.isArray(variants) || variants.length === 0) {
-      res.status(400).json({ message: "Produk wajib memiliki minimal 1 varian" });
-      return;
+      throw new BusinessError("Produk wajib memiliki minimal 1 varian");
     }
     for (const v of variants) {
       const err = validateVariant(v);
-      if (err) {
-        res.status(400).json({ message: err });
-        return;
-      }
+      if (err) throw new BusinessError(err);
     }
+    assertUniqueVariantNames(variants.map((v) => squeeze(v.name)));
+    await assertUniqueProductName(productName);
+    const cleanCategory = await normalizeCategory(category);
 
     // Stok & harga produk dihitung dari varian
     const totalGudang  = variants.reduce((sum, v) => sum + (v.stockGudang ?? 0), 0);
@@ -156,9 +197,9 @@ export const createProduct = async (req: Request, res: Response): Promise<void> 
       const created = await tx.products.create({
         data: {
           productId,
-          name:        name.toString().trim(),
-          description: description || null,
-          category:    category    || null,
+          name:        productName,
+          description: cleanDescription,
+          category:    cleanCategory,
           price:       lowestPrice,
           imageUrl:    imageUrl    || null,
           stockGudang: totalGudang,
@@ -166,9 +207,9 @@ export const createProduct = async (req: Request, res: Response): Promise<void> 
           Variants: {
             create: variants.map((v) => ({
               variantId:   uuidv4(),
-              name:        v.name.trim(),
-              type:        v.type?.trim()  || DEFAULT_VARIANT_TYPE,
-              value:       v.value?.trim() || DEFAULT_VARIANT_VALUE,
+              name:        squeeze(v.name),
+              type:        squeeze(v.type)  || DEFAULT_VARIANT_TYPE,
+              value:       squeeze(v.value) || DEFAULT_VARIANT_VALUE,
               imageUrl:    v.imageUrl      || null,
               price:       v.price,
               stockGudang: v.stockGudang ?? 0,
@@ -215,8 +256,7 @@ export const createProduct = async (req: Request, res: Response): Promise<void> 
 
     res.status(201).json(product);
   } catch (error) {
-    console.error("createProduct error:", error);
-    res.status(500).json({ message: "Error creating product" });
+    sendError(res, error, "Error creating product");
   }
 };
 
@@ -242,18 +282,17 @@ export const updateProduct = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    // ── Validasi ──
-    if (name !== undefined && !name.toString().trim()) {
-      res.status(400).json({ message: "Nama produk tidak boleh kosong" });
-      return;
-    }
-
     const hasVariants = existing.Variants.length > 0;
 
+    // ── Validasi ──
     const updateData: Record<string, unknown> = {};
-    if (name        !== undefined) updateData.name        = name.toString().trim();
-    if (description !== undefined) updateData.description = description;
-    if (category    !== undefined) updateData.category    = category;
+    if (name !== undefined) {
+      const productName = requiredText(name, "Nama produk", 3, 100);
+      await assertUniqueProductName(productName, productId);
+      updateData.name = productName;
+    }
+    if (description !== undefined) updateData.description = optionalText(description, "Deskripsi", 500);
+    if (category    !== undefined) updateData.category    = await normalizeCategory(category);
     if (imageUrl    !== undefined) updateData.imageUrl    = imageUrl;
     if (isActive    !== undefined) updateData.isActive    = isActive;
 
@@ -261,8 +300,7 @@ export const updateProduct = async (req: Request, res: Response): Promise<void> 
     // yang masih boleh diubah harganya langsung.
     if (price !== undefined && !hasVariants) {
       if (!isValidPrice(price)) {
-        res.status(400).json({ message: "Harga harus berupa angka 0 atau lebih" });
-        return;
+        throw new BusinessError(`Harga harus Rp 1 – Rp ${formatLimit(PRICE_MAX)} (tanpa desimal)`);
       }
       updateData.price = price;
     }
@@ -275,8 +313,7 @@ export const updateProduct = async (req: Request, res: Response): Promise<void> 
 
     res.json(product);
   } catch (error) {
-    console.error("updateProduct error:", error);
-    res.status(500).json({ message: "Error updating product" });
+    sendError(res, error, "Error updating product");
   }
 };
 
@@ -331,6 +368,11 @@ export const addVariant = async (req: Request, res: Response): Promise<void> => 
       res.status(400).json({ message: err });
       return;
     }
+    const variantName = squeeze(body.name);
+    if (product.Variants.some((v) => v.name.toLowerCase() === variantName.toLowerCase())) {
+      res.status(400).json({ message: `Varian "${variantName}" sudah ada pada produk ini` });
+      return;
+    }
 
     // Produk lama yang masih punya stok tanpa varian tidak boleh langsung ditambah varian,
     // karena stok produk akan dihitung ulang dari stok varian.
@@ -348,7 +390,6 @@ export const addVariant = async (req: Request, res: Response): Promise<void> => 
     const vGudang       = body.stockGudang ?? 0;
     const vToko         = body.stockToko   ?? 0;
     const currentUserId = req.session.userId ?? "";
-    const variantName   = body.name!.trim();
 
     const variant = await prisma.$transaction(async (tx) => {
       const created = await tx.productVariant.create({
@@ -356,8 +397,8 @@ export const addVariant = async (req: Request, res: Response): Promise<void> => 
           variantId:   uuidv4(),
           productId,
           name:        variantName,
-          type:        body.type?.trim()  || DEFAULT_VARIANT_TYPE,
-          value:       body.value?.trim() || DEFAULT_VARIANT_VALUE,
+          type:        squeeze(body.type)  || DEFAULT_VARIANT_TYPE,
+          value:       squeeze(body.value) || DEFAULT_VARIANT_VALUE,
           imageUrl:    body.imageUrl      || null,
           price:       body.price!,
           stockGudang: vGudang,
@@ -425,6 +466,8 @@ export const updateVariant = async (req: Request, res: Response): Promise<void> 
     // Gabungkan data lama + baru lalu validasi hasil akhirnya
     const merged: Partial<VariantInput> = {
       name:  body.name  ?? existing.name,
+      type:  body.type,
+      value: body.value,
       price: body.price !== undefined ? body.price : existing.price ?? undefined,
     };
     const err = validateVariant(merged);
@@ -432,14 +475,25 @@ export const updateVariant = async (req: Request, res: Response): Promise<void> 
       res.status(400).json({ message: err });
       return;
     }
+    const variantName = squeeze(merged.name);
+    const duplicate = await prisma.productVariant.findFirst({
+      where: {
+        productId, isActive: true, variantId: { not: variantId },
+        name: { equals: variantName, mode: "insensitive" },
+      },
+    });
+    if (duplicate) {
+      res.status(400).json({ message: `Varian "${variantName}" sudah ada pada produk ini` });
+      return;
+    }
 
     const variant = await prisma.$transaction(async (tx) => {
       const updated = await tx.productVariant.update({
         where: { variantId },
         data: {
-          name:     merged.name!.trim(),
-          type:     body.type !== undefined  ? (body.type.trim()  || DEFAULT_VARIANT_TYPE)  : existing.type,
-          value:    body.value !== undefined ? (body.value.trim() || DEFAULT_VARIANT_VALUE) : existing.value,
+          name:     variantName,
+          type:     body.type !== undefined  ? (squeeze(body.type)  || DEFAULT_VARIANT_TYPE)  : existing.type,
+          value:    body.value !== undefined ? (squeeze(body.value) || DEFAULT_VARIANT_VALUE) : existing.value,
           imageUrl: body.imageUrl !== undefined ? (body.imageUrl || null) : existing.imageUrl,
           price:    merged.price!,
         },

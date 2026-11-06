@@ -1,6 +1,26 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma";
+import { BusinessError } from "../lib/stockHelpers";
+import {
+  validateGmail,
+  validatePassword,
+  validatePersonName,
+  validateUsername,
+} from "../lib/validation";
+
+// ── Batas percobaan login (per username/email, disimpan di memori) ──
+// 5x salah → dikunci 5 menit. Hitungan direset jika salah terakhir > 15 menit lalu.
+const MAX_LOGIN_FAILURES = 5;
+const LOGIN_LOCK_MS      = 5 * 60 * 1000;
+const FAILURE_WINDOW_MS  = 15 * 60 * 1000;
+const loginFailures = new Map<string, { count: number; lastAt: number; lockedUntil: number }>();
+
+const pruneLoginFailures = (now: number) => {
+  for (const [key, f] of loginFailures) {
+    if (f.lockedUntil < now && now - f.lastAt > FAILURE_WINDOW_MS) loginFailures.delete(key);
+  }
+};
 
 // Nama & opsi cookie harus sama dengan konfigurasi session di index.ts,
 // kalau tidak clearCookie tidak akan menghapus cookie yang benar.
@@ -26,14 +46,17 @@ export const initSuperAdmin = async (req: Request, res: Response) => {
       });
     }
 
-    const { name, username, email, password } = req.body;
-    if (!name || !username || !email || !password) {
-      return res.status(400).json({ message: "Semua field wajib diisi" });
-    }
-    if (password.length < 8) {
-      return res
-        .status(400)
-        .json({ message: "Password minimal 8 karakter" });
+    // Aturan sama dengan tambah user (userController)
+    const body = req.body ?? {};
+    let name: string, username: string, email: string, password: string;
+    try {
+      name     = validatePersonName(body.name);
+      username = validateUsername(body.username);
+      email    = validateGmail(body.email);
+      password = validatePassword(body.password, username);
+    } catch (e) {
+      if (e instanceof BusinessError) return res.status(400).json({ message: e.message });
+      throw e;
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -66,32 +89,53 @@ export const initSuperAdmin = async (req: Request, res: Response) => {
 // ── Login ─────────────────────────────────────────────────────────
 export const login = async (req: Request, res: Response) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) {
+    const { username, password } = req.body ?? {};
+    const identifier = typeof username === "string" ? username.trim() : "";
+    if (!identifier || typeof password !== "string" || !password) {
       return res
         .status(400)
         .json({ message: "Username dan password wajib diisi" });
     }
 
+    const key = identifier.toLowerCase();
+    const now = Date.now();
+    let failure = loginFailures.get(key);
+    if (failure && failure.lockedUntil > now) {
+      const minutes = Math.ceil((failure.lockedUntil - now) / 60000);
+      return res.status(429).json({
+        message: `Terlalu banyak percobaan login gagal. Coba lagi dalam ${minutes} menit.`,
+      });
+    }
+    if (failure && now - failure.lastAt > FAILURE_WINDOW_MS) failure = undefined;
+
+    // Username & email tidak peka huruf besar/kecil (duplikat sudah dicegah tanpa beda huruf)
     const user = await prisma.users.findFirst({
       where: {
-        OR: [{ username }, { email: username }],
+        OR: [
+          { username: { equals: identifier, mode: "insensitive" } },
+          { email:    { equals: identifier, mode: "insensitive" } },
+        ],
         isActive: true,
       },
     });
 
-    if (!user) {
-      return res
-        .status(401)
-        .json({ message: "Username/email atau password salah" });
+    const isValid = !!user && (await bcrypt.compare(password, user.password));
+    if (!user || !isValid) {
+      const count = (failure?.count ?? 0) + 1;
+      const locked = count >= MAX_LOGIN_FAILURES;
+      loginFailures.set(key, { count, lastAt: now, lockedUntil: locked ? now + LOGIN_LOCK_MS : 0 });
+      if (loginFailures.size > 500) pruneLoginFailures(now);
+      if (locked) {
+        return res.status(429).json({
+          message: `Login gagal ${MAX_LOGIN_FAILURES} kali. Coba lagi dalam ${LOGIN_LOCK_MS / 60000} menit.`,
+        });
+      }
+      return res.status(401).json({
+        message: `Username/email atau password salah. Sisa percobaan: ${MAX_LOGIN_FAILURES - count}.`,
+      });
     }
 
-    const isValid = await bcrypt.compare(password, user.password);
-    if (!isValid) {
-      return res
-        .status(401)
-        .json({ message: "Username/email atau password salah" });
-    }
+    loginFailures.delete(key);
 
     req.session.userId   = user.userId;
     req.session.username = user.username;

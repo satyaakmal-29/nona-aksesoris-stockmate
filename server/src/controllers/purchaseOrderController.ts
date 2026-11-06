@@ -6,7 +6,6 @@ import { notifyByRole } from "./notificationController";
 import {
   BusinessError,
   sendError,
-  isPositiveInt,
   isNonNegativeInt,
   cleanText,
   requireImage,
@@ -14,6 +13,16 @@ import {
   nextNumber,
   syncProductAggregates,
 } from "../lib/stockHelpers";
+import {
+  PRICE_MAX,
+  QTY_MAX,
+  formatLimit,
+  isValidPrice,
+  isValidQty,
+  optionalText,
+  requiredText,
+  validateDocNumber,
+} from "../lib/validation";
 
 // Purchase Order = pembelian barang ke SUPPLIER.
 // Super Admin membuat (dengan bukti nota) → Admin Gudang memvalidasi penerimaan fisik.
@@ -103,12 +112,9 @@ export const createPurchaseOrder = async (
     const body = req.body ?? {};
 
     // ── Bukti pembelian ──
-    const supplier = cleanText(body.supplier);
-    const invoiceNumber = cleanText(body.invoiceNumber);
-    const trackingNumber = cleanText(body.trackingNumber);
-    if (!supplier) throw new BusinessError("Nama supplier wajib diisi");
-    if (!invoiceNumber) throw new BusinessError("Nomor nota / invoice wajib diisi");
-    if (!trackingNumber) throw new BusinessError("Nomor resi / pengiriman wajib diisi");
+    const supplier = requiredText(body.supplier, "Nama supplier", 2, 60);
+    const invoiceNumber = validateDocNumber(body.invoiceNumber, "Nomor nota / invoice");
+    const trackingNumber = validateDocNumber(body.trackingNumber, "Nomor resi / pengiriman");
 
     const invoiceDate = new Date(body.invoiceDate);
     if (!body.invoiceDate || Number.isNaN(invoiceDate.getTime())) {
@@ -124,7 +130,7 @@ export const createPurchaseOrder = async (
     }
 
     const invoiceImage = requireImage(body.invoiceImage, "Foto nota");
-    const notes = cleanText(body.notes) || null;
+    const notes = optionalText(body.notes, "Catatan", 200);
 
     // Nota yang sama dari supplier yang sama tidak boleh dicatat dua kali
     const duplicate = await prisma.purchaseOrder.findFirst({
@@ -151,11 +157,11 @@ export const createPurchaseOrder = async (
 
     for (const item of items) {
       if (!item.productId) throw new BusinessError("Setiap item wajib memilih produk");
-      if (!isPositiveInt(item.qtyOrdered)) {
-        throw new BusinessError("Jumlah minimal 1 dan harus bilangan bulat");
+      if (!isValidQty(item.qtyOrdered)) {
+        throw new BusinessError(`Jumlah harus bilangan bulat 1 – ${formatLimit(QTY_MAX)}`);
       }
-      if (typeof item.unitCost !== "number" || !(item.unitCost > 0)) {
-        throw new BusinessError("Harga beli satuan harus lebih dari 0");
+      if (!isValidPrice(item.unitCost)) {
+        throw new BusinessError(`Harga beli satuan harus Rp 1 – Rp ${formatLimit(PRICE_MAX)} (tanpa desimal)`);
       }
 
       const product = await prisma.products.findUnique({
@@ -263,8 +269,11 @@ export const receivePurchaseOrder = async (
     const body = req.body ?? {};
 
     const receiptImage = requireImage(body.receiptImage, "Foto bukti penerimaan");
-    const deliveryNoteNumber = cleanText(body.deliveryNoteNumber) || null;
-    const receiveNotes = cleanText(body.receiveNotes) || null;
+    // Nomor surat jalan supplier opsional; jika diisi, formatnya sama dengan nomor dokumen lain
+    const deliveryNoteNumber = cleanText(body.deliveryNoteNumber)
+      ? validateDocNumber(body.deliveryNoteNumber, "Nomor surat jalan")
+      : null;
+    const receiveNotes = optionalText(body.receiveNotes, "Catatan penerimaan", 200);
 
     const receivedItems: Array<{
       poItemId: string;
@@ -312,6 +321,7 @@ export const receivePurchaseOrder = async (
           "Isi alasan untuk item yang diterima kurang dari jumlah dipesan"
         );
       }
+      if (note.length > 200) throw new BusinessError("Alasan selisih maksimal 200 karakter");
     }
     if (resolved.every((r) => r.qty === 0)) {
       throw new BusinessError("Tidak ada barang yang diterima");

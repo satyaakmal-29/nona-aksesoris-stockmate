@@ -11,6 +11,7 @@ import {
   nextNumber,
 } from "../lib/stockHelpers";
 import { localDateRange, startOfLocalDay } from "../lib/dateHelpers";
+import { EXPENSE_MAX, formatLimit, optionalText } from "../lib/validation";
 
 // Pengeluaran = operasional (input manual Super Admin) + pembelian stok
 // (otomatis dari Purchase Order supplier, berdasarkan tanggal nota).
@@ -61,6 +62,9 @@ const parseExpenseBody = (body: Record<string, unknown>) => {
   if (typeof amount !== "number" || !Number.isFinite(amount) || !(amount > 0)) {
     throw new BusinessError("Jumlah pengeluaran harus lebih dari 0");
   }
+  if (amount > EXPENSE_MAX) {
+    throw new BusinessError(`Jumlah pengeluaran maksimal Rp ${formatLimit(EXPENSE_MAX)} per entri`);
+  }
 
   const expenseDate = startOfLocalDay(cleanText(body.expenseDate));
   if (!expenseDate) throw new BusinessError("Tanggal pengeluaran tidak valid");
@@ -79,7 +83,7 @@ const parseExpenseBody = (body: Record<string, unknown>) => {
       ? null
       : requireImage(body.receiptImage, "Foto bukti");
 
-  const notes = cleanText(body.notes) || null;
+  const notes = optionalText(body.notes, "Catatan", 200);
 
   return { category, description, amount, expenseDate, paymentMethod, receiptImage, notes };
 };

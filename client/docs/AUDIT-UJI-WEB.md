@@ -16,6 +16,7 @@ Nomor `BB#` = nomor skenario Black Box (Tabel 3.2) yang terkait.
   - Produk B: 1 varian (stok gudang 3, stok toko 2).
 - [ ] **P5** Siapkan 3 foto di laptop/HP: foto nota, foto surat jalan, foto barang (boleh foto apa saja, termasuk foto besar > 3 MB dari kamera HP).
 - [ ] **P6** Buka DevTools → tab **Network** (untuk beberapa cek di bawah).
+- [ ] **P7** Untuk bagian 6c (email nota): 1 akun Gmail toko dengan **Verifikasi 2 Langkah** aktif + App Password (myaccount.google.com/apppasswords), dan 1 email lain sebagai "email pembeli" (boleh selain Gmail). Laptop harus tersambung internet.
 
 ---
 
@@ -155,7 +156,7 @@ Login **AT**.
 | T7 | Tunai: isi uang dibayar (input Rupiah titik ribuan) + tombol "Uang pas" / nominal cepat | Kembalian tampil; jika kurang tampil "Kurang Rp …" | [ ] |
 | T8 | Bayar kurang (tunai) | Ditolak dengan pesan Rupiah, mis. "Pembayaran kurang Rp 40.000. Total Rp 50.000 …" | [ ] |
 | T9 | Transfer | Tidak perlu isi jumlah; tercatat dibayar pas, kembalian Rp 0 | [ ] |
-| T10 | **Cetak struk (BB#19)** | Jendela cetak berisi struk yang rapi (nama toko, no., kasir, item, total, bayar, kembali); jika pop-up diblokir muncul pesan | [ ] |
+| T10 | **Cetak struk (BB#19)** | Pratinjau & jendela cetak berisi struk 58 mm yang rapi (nama toko, no., kasir, item, total, bayar, kembali; Transfer: rekening tujuan utuh satu baris). **Save as PDF** → 1 halaman selebar 58 mm tanpa header/footer tanggal & URL, tanpa sisa kertas kosong. Jika pop-up diblokir muncul pesan | [ ] |
 | T11 | Detail transaksi di daftar | Item + harga satuan, dibayar, kembalian, catatan | [ ] |
 | T12 | Filter tanggal / metode / cari nomor atau nama pelanggan | Daftar & ringkasan (jumlah, pendapatan, item) mengikuti filter | [ ] |
 | T13 | SA / AG membuka Transaksi | Bisa melihat riwayat, **tidak** ada tombol Transaksi Baru | [ ] |
@@ -184,6 +185,22 @@ Persiapan: siapkan foto stiker QRIS toko (QRIS **statis**, tanpa nominal) dan HP
 | Q15 | Laporan Penjualan & Dashboard saat ada QRIS menunggu / batal | Hanya transaksi **lunas** yang dihitung | [ ] |
 | Q16 | Buat QRIS untuk stok terakhir → jual stok itu secara tunai → konfirmasi QRIS | Konfirmasi ditolak "Stok toko … tidak cukup"; transaksi QRIS tetap Menunggu → batalkan & kembalikan dana pembeli | [ ] |
 | Q17 | Klik Pembayaran Diterima dua kali cepat / di dua tab | Hanya satu yang berhasil; stok tidak berkurang dua kali | [ ] |
+
+## 6c. Nota Digital lewat Email
+
+| ID | Langkah | Hasil yang diharapkan | OK |
+| --- | --- | --- | --- |
+| E1 | Sebelum email diatur: AT buka Transaksi Baru | Kolom **Email Pembeli** nonaktif dengan keterangan "Super Admin perlu mengatur Gmail toko"; transaksi tetap bisa diproses | [ ] |
+| E2 | SA → Pengaturan → **Email Nota**: isi email non-Gmail / Gmail tanpa App Password / App Password bukan 16 huruf → Simpan | Ditolak dengan pesan di bawah kolomnya | [ ] |
+| E3 | SA isi Gmail toko + App Password benar → Simpan → **Kirim email uji** | Status "Email nota aktif"; email "Email uji - …" masuk ke Gmail toko | [ ] |
+| E4 | SA isi App Password salah → Simpan → Kirim email uji | Pesan "Gmail menolak login…"; perbaiki App Password lalu ulangi E3 | [ ] |
+| E5 | AT: transaksi tunai **tanpa** email pembeli | Struk tampil; panel Nota digital "Mengirim…" lalu "terkirim ke (Gmail toko)"; email nota masuk ke Gmail toko | [ ] |
+| E6 | AT: transaksi Transfer **dengan** email pembeli (huruf besar boleh) | Email nota masuk ke email pembeli; salinan masuk ke Gmail toko (pembeli tidak melihat alamat toko di penerima); isi: nama toko, no. nota, item, total, rekening tujuan | [ ] |
+| E7 | Email pembeli format salah (mis. `budi@`) | Pesan "Email pembeli tidak valid" di bawah kolom; transaksi tidak diproses | [ ] |
+| E8 | QRIS dengan email pembeli → Pembayaran Diterima | Email nota baru terkirim setelah dikonfirmasi lunas (bukan saat QR dibuat); QRIS dibatalkan → tidak ada email | [ ] |
+| E9 | Buka struk transaksi lama → isi email pembeli di panel **Nota digital** → Kirim | "Nota terkirim ke …"; kartu transaksi menampilkan status email | [ ] |
+| E10 | Matikan Wi-Fi → transaksi tunai | Transaksi tetap **Lunas** & stok berkurang; status email "gagal: Tidak bisa terhubung…"; nyalakan Wi-Fi → Kirim ulang dari panel → terkirim | [ ] |
+| E11 | SA → Hapus email nota | Kolom Email Pembeli di kasir kembali nonaktif; transaksi tetap jalan tanpa email | [ ] |
 
 ## 7. Laporan (BB#23–25)
 
@@ -229,6 +246,22 @@ Semua angka dihitung dari data nyata (transaksi, PO, SR, stok, pengeluaran); dip
 | N8 | **(Baru)** Stok gudang baru turun di bawah 10 atau habis karena pengiriman SR | SA menerima notifikasi **Stok Gudang** | [ ] |
 | N9 | Transaksi berikutnya saat stok sudah di bawah ambang | **Tidak** ada notifikasi berulang (hanya saat melewati ambang / baru habis) | [ ] |
 | N10 | Jumlah badge saat notifikasi belum dibaca > 50 | Badge tetap akurat (dihitung terpisah dari 50 notifikasi terbaru) | [ ] |
+
+### 9a. Notifikasi via WhatsApp ("Kirim via WA")
+
+Persiapan: isi nomor WhatsApp ketiga akun (Pengaturan → Nomor WhatsApp, atau SA di menu Pengguna); laptop sudah login WhatsApp Web / WhatsApp Desktop.
+
+| ID | Langkah | Hasil yang diharapkan | OK |
+| --- | --- | --- | --- |
+| W1 | Isi nomor WA: `0812-3456-7890`, `+62 812 3456 7890`, `812 3456 7890` | Tersimpan; tampil kembali sebagai `0812-3456-7890` | [ ] |
+| W2 | Isi nomor telepon rumah `021…` / terlalu pendek / huruf | Pesan "Nomor WhatsApp harus nomor HP Indonesia" | [ ] |
+| W3 | SA buat PO | Setelah tersimpan muncul jendela **Kirim Notifikasi via WhatsApp** berisi Admin Gudang yang punya nomor + pratinjau pesan (no. PO, supplier, barang, total) | [ ] |
+| W4 | Klik **Kirim via WA** | WhatsApp terbuka ke nomor tsb dengan pesan sudah terisi; tombol berubah "Dibuka" | [ ] |
+| W5 | AG validasi penerimaan PO dengan selisih | Jendela WA ke Super Admin; pesan berjudul "ADA SELISIH" + "diterima x dari y pcs (alasan)" | [ ] |
+| W6 | Alur SR: buat (SA→AG), setujui/tolak (AG→SA), kirim (AG→AT & SA), terima (AT→SA & AG) | Setiap tahap memunculkan jendela WA dengan penerima & isi sesuai tahap | [ ] |
+| W7 | Belum ada penerima yang mengisi nomor | Keterangan oranye "Belum ada … yang mengisi nomor WhatsApp"; tombol **Salin pesan** tetap bisa dipakai | [ ] |
+| W8 | Tutup jendela WA, lalu buka kartu PO/SR → **Kirim via WA** | Jendela muncul lagi (hanya untuk peran yang melakukan tahap terakhir) | [ ] |
+| W9 | Akun nonaktif / akun sendiri | Tidak muncul di daftar penerima | [ ] |
 
 ## 9b. Pengeluaran / Expenses (Super Admin)
 

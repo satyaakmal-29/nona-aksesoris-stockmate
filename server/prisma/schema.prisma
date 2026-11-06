@@ -20,6 +20,8 @@ model Users {
   language     String   @default("English")
   notification Boolean  @default(true)
   profileImage String?
+  // Nomor WhatsApp format internasional tanpa "+" (mis. 6281234567890), untuk tombol "Kirim via WA"
+  whatsapp     String?
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @default(now()) @updatedAt
@@ -236,6 +238,18 @@ model Transaction {
   //   "cancelled"       → QRIS dibatalkan, stok tidak berubah
   status        String    @default("paid")
   qrisPayload   String? // QRIS dinamis (nominal terisi) untuk ditampilkan ulang
+  // Transfer: salinan rekening tujuan saat transaksi dibuat (untuk audit; tidak ikut
+  // berubah jika rekening di Pengaturan diganti). Null untuk tunai/QRIS & transaksi lama.
+  transferBankName      String?
+  transferAccountNumber String?
+  transferAccountName   String?
+  // Nota digital lewat email: salinan selalu ke email toko; ke pembeli jika customerEmail diisi.
+  // receiptEmailStatus: null = belum/tidak dikirim | "sending" | "sent" | "failed"
+  customerEmail      String?
+  receiptEmailStatus String?
+  receiptEmailTo     String? // penerima pada pengiriman terakhir yang berhasil
+  receiptEmailError  String?
+  receiptEmailAt     DateTime? // waktu percobaan kirim terakhir
   paidAt        DateTime?
   confirmedById String?
   cancelledAt   DateTime?
@@ -264,6 +278,13 @@ model StoreSettings {
   qrisPayload  String? // QRIS statis toko (teks EMV, diawali 000201)
   qrisMerchant String? // nama merchant dari QRIS (tag 59), untuk ditampilkan
   qrisCity     String? // kota merchant (tag 60)
+  // Satu rekening tujuan pembayaran Transfer (ketiganya diisi bersama, atau semua kosong)
+  bankName          String?
+  bankAccountNumber String?
+  bankAccountName   String? // atas nama
+  // Email nota: Gmail toko (pengirim & penerima salinan) + App Password terenkripsi (lib/secretBox)
+  storeEmail      String?
+  smtpPasswordEnc String?
   updatedById  String?
   updatedAt    DateTime @default(now()) @updatedAt
 

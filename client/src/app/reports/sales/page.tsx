@@ -4,7 +4,7 @@ import { useState } from "react";
 import Header from "@/app/(components)/Header";
 import ExportMenu from "@/app/(components)/ExportMenu";
 import { useAppSelector } from "@/app/redux";
-import { useGetSalesReportQuery, SalesReport } from "@/state/api";
+import { useGetSalesReportQuery, SalesReport, Transaction } from "@/state/api";
 import {
   ExportFormat,
   ReportDocument,
@@ -36,6 +36,12 @@ const PAYMENT_LABELS: Record<string, string> = {
   transfer: "Transfer",
   qris:     "QRIS",
 };
+
+// Rekening tujuan Transfer (salinan saat transaksi dibuat), untuk audit
+const transferAccountLabel = (t: Transaction) =>
+  t.transferAccountNumber
+    ? `${t.transferBankName ?? ""} ${t.transferAccountNumber} a.n. ${t.transferAccountName ?? ""}`.trim()
+    : t.paymentMethod === "transfer" ? "Tidak tercatat" : "-";
 
 const formatDateTime = (iso: string) =>
   new Date(iso).toLocaleString("id-ID", {
@@ -81,6 +87,7 @@ const buildSalesReport = (
           { header: "Kasir", width: 18 },
           { header: "Pelanggan", width: 18 },
           { header: "Metode", width: 12 },
+          { header: "Rekening Tujuan", width: 34 },
           { header: "Jumlah Item", type: "number", width: 12 },
           { header: "Total", type: "currency", width: 16 },
         ],
@@ -91,10 +98,11 @@ const buildSalesReport = (
           t.cashier?.name ?? "-",
           t.customerName || "-",
           PAYMENT_LABELS[t.paymentMethod] ?? t.paymentMethod,
+          transferAccountLabel(t),
           t.Items.reduce((s, it) => s + it.qty, 0),
           t.totalAmount,
         ]),
-        totalRow: ["", "TOTAL", "", "", "", "", summary.totalItemTerjual, summary.totalRevenue],
+        totalRow: ["", "TOTAL", "", "", "", "", "", summary.totalItemTerjual, summary.totalRevenue],
       },
       {
         title: "Produk Terlaris",
@@ -376,6 +384,11 @@ const SalesReportPage = () => {
                         }`}>
                           {trx.paymentMethod.toUpperCase()}
                         </span>
+                        {trx.paymentMethod === "transfer" && (
+                          <span className="mt-0.5 block text-[11px] text-gray-400" title={transferAccountLabel(trx)}>
+                            {trx.transferAccountNumber ? `${trx.transferBankName} ${trx.transferAccountNumber}` : "Rekening tidak tercatat"}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2 px-3 text-right font-semibold text-gray-800 dark:text-gray-100">
                         {formatCurrency(trx.totalAmount)}

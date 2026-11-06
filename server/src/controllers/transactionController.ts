@@ -14,14 +14,25 @@ import {
 import { localDateRange, formatRupiah } from "../lib/dateHelpers";
 import { buildDynamicQris } from "../lib/qris";
 import { notifyLowStock } from "./notificationController";
-import { getStoreSettingsRow } from "./storeSettingsController";
+import {
+  EMAIL_NOT_READY,
+  getMailAccount,
+  getStoreSettingsRow,
+  isBankConfigured,
+} from "./storeSettingsController";
+import { CASH_OVERPAY_MAX, TRX_QTY_MAX, formatLimit, optionalEmail, optionalText } from "../lib/validation";
+import { mailErrorMessage, sendMail } from "../lib/mailer";
+import { buildReceiptEmail } from "../lib/receiptEmail";
 
 // Transaksi penjualan toko (hanya Admin Toko yang membuat).
 // - Harga diambil dari katalog (harga varian / produk), bukan dari klien.
 // - Tunai / transfer: langsung lunas, stok toko dikurangi saat itu juga.
+//   Transfer wajib ada rekening toko di Pengaturan (kasir mengecek bukti transfer dulu).
 // - QRIS: dibuat "pending_payment" dengan QRIS dinamis (nominal terisi) dari QRIS toko.
 //   Stok baru dikurangi saat kasir mengonfirmasi pembayaran diterima.
 // Stok selalu dikurangi secara atomik: gagal jika stok tidak cukup.
+// - Nota email: begitu lunas, nota dikirim di latar belakang ke email toko (+ email pembeli
+//   jika diisi). Transaksi tidak pernah gagal / menunggu karena email.
 
 const PAYMENT_METHODS = ["cash", "transfer", "qris"] as const;
 const STATUSES = ["paid", "pending_payment", "cancelled"];
@@ -122,6 +133,92 @@ const applySale = async (
   return changes;
 };
 
+// Status "sending" lebih lama dari ini dianggap macet → boleh kirim ulang
+const EMAIL_SENDING_STALE_MS = 60_000;
+
+// Dipanggil saat server menyala: pengiriman yang terputus karena server berhenti
+// ditandai gagal agar kasir bisa mengirim ulang (tidak tertahan di "sending").
+export const resetInterruptedReceiptEmails = async (): Promise<void> => {
+  try {
+    const { count } = await prisma.transaction.updateMany({
+      where: { receiptEmailStatus: "sending" },
+      data:  {
+        receiptEmailStatus: "failed",
+        receiptEmailError:  "Pengiriman terputus karena server dimulai ulang. Kirim ulang nota.",
+      },
+    });
+    if (count > 0) console.log(`Nota email terputus ditandai gagal: ${count}`);
+  } catch (err) {
+    console.error("Gagal memeriksa nota email yang terputus:", err);
+  }
+};
+
+// Kirim nota email & catat hasilnya di transaksi. Tidak pernah melempar error.
+// auto = pengiriman otomatis saat lunas: ke pembeli (jika ada) + salinan ke toko.
+// Manual (kirim ulang): ke pembeli; salinan toko hanya jika toko belum pernah menerimanya.
+const deliverReceiptEmail = async (
+  transactionId: string,
+  auto: boolean
+): Promise<{ ok: boolean; message: string }> => {
+  try {
+    const trx = await prisma.transaction.findUnique({
+      where:   { transactionId },
+      include: { cashier: { select: { name: true } }, Items: true },
+    });
+    if (!trx || trx.status !== "paid") {
+      return { ok: false, message: "Nota hanya bisa dikirim untuk transaksi yang sudah lunas" };
+    }
+
+    const settings = await getStoreSettingsRow();
+    const account = getMailAccount(settings);
+    if (!account) {
+      await prisma.transaction.update({
+        where: { transactionId },
+        data:  { receiptEmailStatus: "failed", receiptEmailError: EMAIL_NOT_READY, receiptEmailAt: new Date() },
+      });
+      return { ok: false, message: EMAIL_NOT_READY };
+    }
+
+    const delivered = (trx.receiptEmailTo ?? "").split(", ").filter(Boolean);
+    const buyer = trx.customerEmail && trx.customerEmail !== account.user ? trx.customerEmail : null;
+    const withStore = auto || !buyer || !delivered.includes(account.user);
+    const to = buyer ?? account.user;
+    const bcc = buyer && withStore ? account.user : undefined;
+
+    await prisma.transaction.update({
+      where: { transactionId },
+      data:  { receiptEmailStatus: "sending", receiptEmailError: null, receiptEmailAt: new Date() },
+    });
+
+    try {
+      await sendMail(account, { to, bcc, ...buildReceiptEmail(trx, settings) });
+    } catch (err) {
+      const message = mailErrorMessage(err);
+      console.error(`Nota email ${trx.transactionNumber} gagal:`, err);
+      await prisma.transaction.update({
+        where: { transactionId },
+        data:  { receiptEmailStatus: "failed", receiptEmailError: message },
+      });
+      return { ok: false, message };
+    }
+
+    // receiptEmailTo = semua alamat yang sudah berhasil menerima nota ini
+    const recipients = [to, ...(bcc ? [bcc] : [])];
+    await prisma.transaction.update({
+      where: { transactionId },
+      data:  {
+        receiptEmailStatus: "sent",
+        receiptEmailError:  null,
+        receiptEmailTo:     [...new Set([...delivered, ...recipients])].join(", "),
+      },
+    });
+    return { ok: true, message: `Nota terkirim ke ${recipients.join(" & ")}` };
+  } catch (err) {
+    console.error("Gagal memproses nota email:", err);
+    return { ok: false, message: "Gagal memproses nota email" };
+  }
+};
+
 // ─── GET /transactions ────────────────────────────────────────────
 // ?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&paymentMethod=&search=&status=
 export const getTransactions = async (
@@ -213,15 +310,18 @@ export const createTransaction = async (
 
     // Gabungkan baris dengan produk/varian yang sama agar cek stok akurat
     const merged = new Map<string, { productId: string; variantId: string | null; qty: number }>();
+    const qtyError = `Jumlah per item harus bilangan bulat 1 – ${formatLimit(TRX_QTY_MAX)}`;
     for (const it of rawItems) {
       if (!it.productId) throw new BusinessError("Setiap item wajib memilih produk");
-      if (!isPositiveInt(it.qty)) throw new BusinessError("Jumlah minimal 1 dan harus bilangan bulat");
+      if (!isPositiveInt(it.qty) || it.qty > TRX_QTY_MAX) throw new BusinessError(qtyError);
       const variantId = it.variantId || null;
       const key = `${it.productId}:${variantId ?? "-"}`;
       const cur = merged.get(key);
       if (cur) cur.qty += it.qty;
       else merged.set(key, { productId: it.productId, variantId, qty: it.qty });
     }
+    // Baris dengan varian sama dijumlahkan → batas berlaku untuk totalnya
+    if ([...merged.values()].some((m) => m.qty > TRX_QTY_MAX)) throw new BusinessError(qtyError);
 
     // ── Validasi produk/varian & ambil harga katalog ──────────────
     const lines: SaleLine[] = [];
@@ -281,14 +381,39 @@ export const createTransaction = async (
           `Pembayaran kurang ${formatRupiah(totalAmount - paymentAmount)}. Total ${formatRupiah(totalAmount)}, dibayar ${formatRupiah(paymentAmount)}.`
         );
       }
+      // Cegah salah ketik nol berlebih (kembalian tidak wajar)
+      if (paymentAmount > totalAmount + CASH_OVERPAY_MAX) {
+        throw new BusinessError(
+          `Uang dibayar terlalu besar. Maksimal ${formatRupiah(totalAmount + CASH_OVERPAY_MAX)} (total + ${formatRupiah(CASH_OVERPAY_MAX)}). Periksa kembali nominalnya.`
+        );
+      }
     }
     const changeAmount = paymentAmount - totalAmount;
+    const settings = await getStoreSettingsRow();
+
+    // ── Transfer: kasir sudah mengecek bukti transfer ke rekening toko → langsung lunas.
+    // Ditolak jika rekening tujuan belum diatur (pembeli tidak tahu harus transfer ke mana).
+    // Rekening saat ini disalin ke transaksi agar audit tetap benar walau rekening diganti.
+    let transferAccount: {
+      transferBankName: string; transferAccountNumber: string; transferAccountName: string;
+    } | null = null;
+    if (paymentMethod === "transfer") {
+      if (!isBankConfigured(settings)) {
+        throw new BusinessError(
+          "Rekening transfer toko belum diatur. Minta Super Admin mengisi rekening di menu Pengaturan."
+        );
+      }
+      transferAccount = {
+        transferBankName:      settings.bankName!,
+        transferAccountNumber: settings.bankAccountNumber!,
+        transferAccountName:   settings.bankAccountName!,
+      };
+    }
 
     // ── QRIS: siapkan QRIS dinamis dari QRIS toko ─────────────────
     const isQris = paymentMethod === "qris";
     let qrisPayload: string | null = null;
     if (isQris) {
-      const settings = await getStoreSettingsRow();
       if (!settings.qrisPayload) {
         throw new BusinessError(
           "QRIS toko belum diatur. Minta Super Admin mengunggah QRIS toko di menu Pengaturan."
@@ -300,8 +425,19 @@ export const createTransaction = async (
       qrisPayload = buildDynamicQris(settings.qrisPayload, totalAmount);
     }
 
-    const customerName = cleanText(body.customerName) || null;
-    const notes        = cleanText(body.notes) || null;
+    const customerName = optionalText(body.customerName, "Nama pelanggan", 50);
+    const notes        = optionalText(body.notes, "Catatan", 200);
+
+    // ── Nota email: salinan ke toko selalu (jika email toko diatur); ke pembeli jika diisi
+    const emailReady    = !!getMailAccount(settings);
+    const customerEmail = optionalEmail(body.customerEmail);
+    if (customerEmail && !emailReady) {
+      throw new BusinessError(
+        "Nota digital belum bisa dikirim karena email toko belum diatur. Kosongkan email pembeli atau minta Super Admin mengatur email di Pengaturan."
+      );
+    }
+    // Tunai / transfer langsung lunas → nota langsung dikirim; QRIS saat pembayaran dikonfirmasi
+    const sendNow = emailReady && !isQris;
 
     // ── Simpan: nomor dibuat di dalam transaksi DB; ulangi jika bentrok ──
     const transactionId = uuidv4();
@@ -334,6 +470,10 @@ export const createTransaction = async (
               paidAt:        isQris ? null : now,
               confirmedById: isQris ? null : cashierId,
               qrisPayload,
+              ...transferAccount,
+              customerEmail,
+              receiptEmailStatus: sendNow ? "sending" : null,
+              receiptEmailAt:     sendNow ? now : null,
               createdAt:     now,
               Items: {
                 create: lines.map((l) => ({
@@ -364,6 +504,9 @@ export const createTransaction = async (
 
     // Peringatan stok toko menipis / habis (setelah transaksi tersimpan)
     await notifyLowStock("toko", lowStock);
+
+    // Nota email dikirim di latar belakang (respons tidak menunggu email)
+    if (sendNow) void deliverReceiptEmail(transactionId, true);
 
     const transaction = await prisma.transaction.findUnique({
       where:   { transactionId },
@@ -410,11 +553,16 @@ export const confirmPayment = async (
     }));
 
     const now = new Date();
+    const sendNow = !!getMailAccount(await getStoreSettingsRow());
     const lowStock = await prisma.$transaction(async (tx) => {
       // Ubah status hanya jika masih menunggu (mencegah konfirmasi ganda)
       const updated = await tx.transaction.updateMany({
         where: { transactionId, status: "pending_payment" },
-        data:  { status: "paid", paidAt: now, confirmedById: userId },
+        data:  {
+          status: "paid", paidAt: now, confirmedById: userId,
+          receiptEmailStatus: sendNow ? "sending" : null,
+          receiptEmailAt:     sendNow ? now : null,
+        },
       });
       if (updated.count === 0) throw new BusinessError("Transaksi ini sudah diproses");
 
@@ -425,6 +573,9 @@ export const confirmPayment = async (
 
     await notifyLowStock("toko", lowStock);
 
+    // QRIS lunas → nota email dikirim di latar belakang
+    if (sendNow) void deliverReceiptEmail(transactionId, true);
+
     const result = await prisma.transaction.findUnique({
       where:   { transactionId },
       include: listInclude,
@@ -432,6 +583,53 @@ export const confirmPayment = async (
     res.json(result);
   } catch (error) {
     sendError(res, error, "Error confirming payment");
+  }
+};
+
+// ─── POST /transactions/:transactionId/email-receipt ─────────────
+// Kirim (ulang) nota digital. body.email: string = email pembeli baru/diganti
+// ("" = tanpa email pembeli → nota dikirim ulang ke email toko); tidak dikirim = tetap.
+export const emailReceipt = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const { transactionId } = req.params as { transactionId: string };
+
+    const trx = await prisma.transaction.findUnique({
+      where:  { transactionId },
+      select: { status: true, receiptEmailStatus: true, receiptEmailAt: true },
+    });
+    if (!trx) {
+      res.status(404).json({ message: "Transaksi tidak ditemukan" });
+      return;
+    }
+    if (trx.status !== "paid") {
+      throw new BusinessError("Nota hanya bisa dikirim untuk transaksi yang sudah lunas");
+    }
+    if (!getMailAccount(await getStoreSettingsRow())) throw new BusinessError(EMAIL_NOT_READY);
+    if (
+      trx.receiptEmailStatus === "sending" && trx.receiptEmailAt &&
+      Date.now() - trx.receiptEmailAt.getTime() < EMAIL_SENDING_STALE_MS
+    ) {
+      throw new BusinessError("Nota sedang dikirim. Tunggu sebentar lalu coba lagi.");
+    }
+
+    if (typeof req.body?.email === "string") {
+      const customerEmail = optionalEmail(req.body.email);
+      await prisma.transaction.update({ where: { transactionId }, data: { customerEmail } });
+    }
+
+    const result = await deliverReceiptEmail(transactionId, false);
+    if (!result.ok) throw new BusinessError(result.message);
+
+    const updated = await prisma.transaction.findUnique({
+      where:   { transactionId },
+      include: listInclude,
+    });
+    res.json(updated);
+  } catch (error) {
+    sendError(res, error, "Error sending receipt email");
   }
 };
 
@@ -444,7 +642,7 @@ export const cancelTransaction = async (
   try {
     const userId = req.session.userId!;
     const { transactionId } = req.params as { transactionId: string };
-    const reason = cleanText(req.body?.reason) || "Dibatalkan kasir";
+    const reason = optionalText(req.body?.reason, "Alasan pembatalan", 200) || "Dibatalkan kasir";
 
     const updated = await prisma.transaction.updateMany({
       where: { transactionId, status: "pending_payment" },

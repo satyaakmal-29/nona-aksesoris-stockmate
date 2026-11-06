@@ -3,8 +3,20 @@
 import { useState } from "react";
 import Image from "next/image";
 import Header from "@/app/(components)/Header";
+import FieldError from "@/app/(components)/FieldError";
 import ProofImageInput, { ProofImageView } from "@/app/(components)/ProofImageInput";
+import WhatsAppNotifyModal from "@/app/(components)/WhatsAppNotify";
 import { useAppSelector } from "@/app/redux";
+import { SR_SENDER_ROLE, WaNotice, buildSrNotice } from "@/lib/whatsapp";
+import {
+  MAX_LEN,
+  QTY_MAX,
+  docNumberError,
+  optionalTextError,
+  qtyError,
+  requiredTextError,
+  squeeze,
+} from "@/lib/validation";
 import {
   useGetStoreReplenishmentsQuery,
   useGetStoreReplenishmentByIdQuery,
@@ -24,6 +36,7 @@ import {
   ChevronUpIcon,
   ClockIcon,
   ImageIcon,
+  MessageCircleIcon,
   PackageCheckIcon,
   PackageIcon,
   PlusCircleIcon,
@@ -215,6 +228,7 @@ type CardActions = {
   onShip:      (sr: StoreReplenishment) => void;
   onReceive:   (sr: StoreReplenishment) => void;
   onViewProof: (sr: StoreReplenishment) => void;
+  onSendWa:    (sr: StoreReplenishment) => void;
 };
 
 const SRCard = ({
@@ -347,6 +361,15 @@ const SRCard = ({
                 <PackageCheckIcon className="h-3.5 w-3.5" /> Konfirmasi Penerimaan
               </button>
             )}
+            {/* Kirim ulang info tahap terakhir via WhatsApp (oleh peran yang melakukan tahap itu) */}
+            {SR_SENDER_ROLE[sr.status] === role && (
+              <button
+                onClick={() => actions.onSendWa(sr)}
+                className={`${btn} bg-green-50 text-green-700 hover:bg-green-100 dark:bg-green-900/30 dark:text-green-300 dark:hover:bg-green-900/50`}
+              >
+                <MessageCircleIcon className="h-3.5 w-3.5" /> Kirim via WA
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -464,6 +487,7 @@ const QtyRowsEditor = ({
           {requireNoteWhenShort && short && (
             <input
               type="text"
+              maxLength={MAX_LEN.note}
               value={row.note}
               onChange={(e) => onChange(item.srItemId, { note: e.target.value })}
               placeholder={notePlaceholder ?? "Alasan (wajib)"}
@@ -497,6 +521,9 @@ const validateRows = (
     }
     if (opts.requireNote && row.qty < max && !row.note.trim()) {
       return `${itemLabel(item)}: isi alasan karena ${opts.shortWord} kurang dari jumlah ${opts.noteWord}`;
+    }
+    if (squeeze(row.note).length > MAX_LEN.note) {
+      return `${itemLabel(item)}: alasan maksimal ${MAX_LEN.note} karakter`;
     }
   }
   if (!opts.allowAllZero && items.every((item) => rows[item.srItemId].qty === 0)) {
@@ -571,6 +598,8 @@ const StoreReplenishmentsPage = () => {
   const [modalError, setModalError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [proofTarget, setProofTarget] = useState<string | null>(null);
+  // Setelah setiap tahap berhasil: tawarkan kirim notifikasi via WhatsApp
+  const [waNotice, setWaNotice] = useState<WaNotice | null>(null);
 
   // Buat
   const [isCreateOpen, setIsCreateOpen] = useState(false);
@@ -594,6 +623,22 @@ const StoreReplenishmentsPage = () => {
   const [receiveImage, setReceiveImage] = useState<string | null>(null);
   const [receiveNotes, setReceiveNotes] = useState("");
 
+  // Error per kolom tampil setelah tombol simpan ditekan, lalu diperbarui saat mengetik
+  const [showErrors, setShowErrors] = useState(false);
+  const shown = (msg: string) => (showErrors ? msg : "");
+
+  const createErrors = {
+    notes: optionalTextError(srNotes, "Catatan", MAX_LEN.note),
+    items: srItems.map((it) => qtyError(it.qtyRequested, "Jumlah")),
+  };
+  const rejectError = requiredTextError(rejectReason, "Alasan penolakan", 3, MAX_LEN.note);
+  const shipErrors = {
+    deliveryNoteNumber: docNumberError(deliveryNoteNumber, "Nomor surat jalan"),
+    courierName:        requiredTextError(courierName, "Nama pengantar", 2, MAX_LEN.courier),
+    notes:              optionalTextError(shipNotes, "Catatan", MAX_LEN.note),
+  };
+  const receiveNotesError = optionalTextError(receiveNotes, "Catatan", MAX_LEN.note);
+
   // Jumlah per item untuk modal setujui / kirim / terima
   const [qtyRows, setQtyRows] = useState<Record<string, QtyRow>>({});
   const patchQtyRow = (id: string, patch: Partial<QtyRow>) =>
@@ -607,6 +652,7 @@ const StoreReplenishmentsPage = () => {
   // ── Buka modal ──
   const openCreate = () => {
     setModalError("");
+    setShowErrors(false);
     setSrNotes("");
     setSrItems([emptyItem()]);
     setIsCreateOpen(true);
@@ -618,11 +664,13 @@ const StoreReplenishmentsPage = () => {
   };
   const openReject = (sr: StoreReplenishment) => {
     setModalError("");
+    setShowErrors(false);
     setRejectReason("");
     setRejectTarget(sr);
   };
   const openShip = (sr: StoreReplenishment) => {
     setModalError("");
+    setShowErrors(false);
     setDeliveryNoteNumber("");
     setCourierName("");
     setDeliveryNoteImage(null);
@@ -632,6 +680,7 @@ const StoreReplenishmentsPage = () => {
   };
   const openReceive = (sr: StoreReplenishment) => {
     setModalError("");
+    setShowErrors(false);
     setReceiveImage(null);
     setReceiveNotes("");
     setQtyRows(initRows(sr.Items, shippedQty));
@@ -641,6 +690,8 @@ const StoreReplenishmentsPage = () => {
   // ── Aksi ──
   const handleCreate = async () => {
     setModalError("");
+    setShowErrors(true);
+    if (createErrors.notes) return setModalError(createErrors.notes);
 
     for (let i = 0; i < srItems.length; i++) {
       const it = srItems[i];
@@ -650,9 +701,7 @@ const StoreReplenishmentsPage = () => {
       if (activeVariants.length > 0 && !it.variantId) {
         return setModalError(`Item ${i + 1}: pilih varian untuk "${p.name}"`);
       }
-      if (!Number.isInteger(it.qtyRequested) || it.qtyRequested < 1) {
-        return setModalError(`Item ${i + 1}: jumlah minimal 1`);
-      }
+      if (createErrors.items[i]) return setModalError(`Item ${i + 1}: ${createErrors.items[i]}`);
       if (!(it.unitCost > 0)) {
         return setModalError(`Item ${i + 1}: harga satuan harus lebih dari 0`);
       }
@@ -661,7 +710,7 @@ const StoreReplenishmentsPage = () => {
     setSubmitting(true);
     try {
       const payload: NewStoreReplenishment = {
-        notes: srNotes.trim() || undefined,
+        notes: squeeze(srNotes) || undefined,
         items: srItems.map((i) => ({
           productId: i.productId,
           variantId: i.variantId || undefined,
@@ -669,8 +718,9 @@ const StoreReplenishmentsPage = () => {
           unitCost: i.unitCost,
         })),
       };
-      await createSR(payload).unwrap();
+      const created = await createSR(payload).unwrap();
       setIsCreateOpen(false);
+      setWaNotice(buildSrNotice(created));
     } catch (err: unknown) {
       setModalError(getErrorMessage(err, "Gagal membuat Store Replenishment"));
     } finally {
@@ -692,7 +742,7 @@ const StoreReplenishmentsPage = () => {
 
     setSubmitting(true);
     try {
-      await approveSR({
+      const approved = await approveSR({
         srId: approveTarget.srId,
         approvedItems: approveTarget.Items.map((item) => ({
           srItemId: item.srItemId,
@@ -700,6 +750,7 @@ const StoreReplenishmentsPage = () => {
         })),
       }).unwrap();
       setApproveTarget(null);
+      setWaNotice(buildSrNotice(approved));
     } catch (err: unknown) {
       setModalError(getErrorMessage(err, "Gagal menyetujui permintaan"));
     } finally {
@@ -710,12 +761,14 @@ const StoreReplenishmentsPage = () => {
   const handleReject = async () => {
     if (!rejectTarget) return;
     setModalError("");
-    if (!rejectReason.trim()) return setModalError("Alasan penolakan wajib diisi");
+    setShowErrors(true);
+    if (rejectError) return;
 
     setSubmitting(true);
     try {
-      await rejectSR({ srId: rejectTarget.srId, reason: rejectReason.trim() }).unwrap();
+      const rejected = await rejectSR({ srId: rejectTarget.srId, reason: squeeze(rejectReason) }).unwrap();
       setRejectTarget(null);
+      setWaNotice(buildSrNotice(rejected));
     } catch (err: unknown) {
       setModalError(getErrorMessage(err, "Gagal menolak permintaan"));
     } finally {
@@ -726,8 +779,10 @@ const StoreReplenishmentsPage = () => {
   const handleShip = async () => {
     if (!shipTarget) return;
     setModalError("");
-    if (!deliveryNoteNumber.trim()) return setModalError("Nomor surat jalan wajib diisi");
-    if (!courierName.trim()) return setModalError("Nama pengantar wajib diisi");
+    setShowErrors(true);
+    if (Object.values(shipErrors).some(Boolean)) {
+      return setModalError("Periksa kembali isian yang ditandai merah.");
+    }
     const error = validateRows(shipTarget.Items, qtyRows, approvedQty, {
       requireNote: true,
       shortWord: "dikirim",
@@ -740,19 +795,20 @@ const StoreReplenishmentsPage = () => {
 
     setSubmitting(true);
     try {
-      await shipSR({
+      const shipped = await shipSR({
         srId: shipTarget.srId,
         deliveryNoteNumber: deliveryNoteNumber.trim(),
-        courierName: courierName.trim(),
+        courierName: squeeze(courierName),
         deliveryNoteImage,
-        shipNotes: shipNotes.trim() || undefined,
+        shipNotes: squeeze(shipNotes) || undefined,
         shippedItems: shipTarget.Items.map((item) => ({
           srItemId: item.srItemId,
           qtyShipped: qtyRows[item.srItemId].qty,
-          shipNote: qtyRows[item.srItemId].note.trim() || undefined,
+          shipNote: squeeze(qtyRows[item.srItemId].note) || undefined,
         })),
       }).unwrap();
       setShipTarget(null);
+      setWaNotice(buildSrNotice(shipped));
     } catch (err: unknown) {
       setModalError(getErrorMessage(err, "Gagal memvalidasi pengiriman"));
     } finally {
@@ -763,6 +819,8 @@ const StoreReplenishmentsPage = () => {
   const handleReceive = async () => {
     if (!receiveTarget) return;
     setModalError("");
+    setShowErrors(true);
+    if (receiveNotesError) return;
     const error = validateRows(receiveTarget.Items, qtyRows, shippedQty, {
       requireNote: true,
       shortWord: "diterima",
@@ -775,17 +833,18 @@ const StoreReplenishmentsPage = () => {
 
     setSubmitting(true);
     try {
-      await receiveSR({
+      const received = await receiveSR({
         srId: receiveTarget.srId,
         receiveImage,
-        receiveNotes: receiveNotes.trim() || undefined,
+        receiveNotes: squeeze(receiveNotes) || undefined,
         receivedItems: receiveTarget.Items.map((item) => ({
           srItemId: item.srItemId,
           qtyReceived: qtyRows[item.srItemId].qty,
-          receiveNote: qtyRows[item.srItemId].note.trim() || undefined,
+          receiveNote: squeeze(qtyRows[item.srItemId].note) || undefined,
         })),
       }).unwrap();
       setReceiveTarget(null);
+      setWaNotice(buildSrNotice(received));
     } catch (err: unknown) {
       setModalError(getErrorMessage(err, "Gagal mengonfirmasi penerimaan"));
     } finally {
@@ -806,6 +865,7 @@ const StoreReplenishmentsPage = () => {
       : "border-gray-300 bg-white text-gray-900"
   }`;
   const labelCss = "mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300";
+  const errCss = (msg: string) => (msg ? "!border-red-400" : "");
   const btnSecondary = `px-4 py-2 rounded-lg text-sm ${
     isDarkMode
       ? "bg-gray-700 text-gray-200 hover:bg-gray-600"
@@ -886,6 +946,7 @@ const StoreReplenishmentsPage = () => {
               onShip: openShip,
               onReceive: openReceive,
               onViewProof: (s) => setProofTarget(s.srId),
+              onSendWa: (s) => setWaNotice(buildSrNotice(s)),
             }}
           />
         ))
@@ -915,14 +976,18 @@ const StoreReplenishmentsPage = () => {
 
             {errorBox}
 
-            <label className={labelCss}>Catatan (opsional)</label>
-            <textarea
-              value={srNotes}
-              onChange={(e) => setSrNotes(e.target.value)}
-              placeholder="Catatan untuk gudang..."
-              rows={2}
-              className={`${inputCss} mb-4 resize-none`}
-            />
+            <div className="mb-4">
+              <label className={labelCss}>Catatan (opsional)</label>
+              <textarea
+                maxLength={MAX_LEN.note}
+                value={srNotes}
+                onChange={(e) => setSrNotes(e.target.value)}
+                placeholder="Catatan untuk gudang..."
+                rows={2}
+                className={`${inputCss} resize-none ${errCss(shown(createErrors.notes))}`}
+              />
+              <FieldError message={shown(createErrors.notes)} />
+            </div>
 
             <div className="mb-2 flex items-center justify-between">
               <p className="text-sm font-semibold text-gray-700 dark:text-gray-300">Item Diminta</p>
@@ -1016,13 +1081,15 @@ const StoreReplenishmentsPage = () => {
                         <input
                           type="number"
                           min={1}
+                          max={QTY_MAX}
                           step={1}
                           value={item.qtyRequested}
                           onChange={(e) =>
-                            patchItem(i, { qtyRequested: Math.floor(Number(e.target.value)) })
+                            patchItem(i, { qtyRequested: Math.min(QTY_MAX, Math.floor(Number(e.target.value))) })
                           }
-                          className={inputCss}
+                          className={`${inputCss} ${errCss(shown(createErrors.items[i] ?? ""))}`}
                         />
+                        <FieldError message={shown(createErrors.items[i] ?? "")} />
                       </div>
                       <div>
                         <label className="mb-1 block text-xs text-gray-500">Harga Satuan</label>
@@ -1123,13 +1190,17 @@ const StoreReplenishmentsPage = () => {
             <label className={labelCss}>
               Alasan penolakan<span className="ml-0.5 text-red-500">*</span>
             </label>
-            <textarea
-              value={rejectReason}
-              onChange={(e) => setRejectReason(e.target.value)}
-              placeholder="Tuliskan alasan penolakan..."
-              rows={3}
-              className={`${inputCss} mb-4 resize-none`}
-            />
+            <div className="mb-4">
+              <textarea
+                maxLength={MAX_LEN.note}
+                value={rejectReason}
+                onChange={(e) => setRejectReason(e.target.value)}
+                placeholder="Tuliskan alasan penolakan..."
+                rows={3}
+                className={`${inputCss} resize-none ${errCss(shown(rejectError))}`}
+              />
+              <FieldError message={shown(rejectError)} />
+            </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setRejectTarget(null)} className={btnSecondary}>
                 Batal
@@ -1170,11 +1241,13 @@ const StoreReplenishmentsPage = () => {
                 </label>
                 <input
                   type="text"
+                  maxLength={MAX_LEN.docNumber}
                   value={deliveryNoteNumber}
-                  onChange={(e) => setDeliveryNoteNumber(e.target.value)}
+                  onChange={(e) => setDeliveryNoteNumber(e.target.value.replace(/\s/g, ""))}
                   placeholder="contoh: SJ-0012"
-                  className={inputCss}
+                  className={`${inputCss} ${errCss(shown(shipErrors.deliveryNoteNumber))}`}
                 />
+                <FieldError message={shown(shipErrors.deliveryNoteNumber)} />
               </div>
               <div>
                 <label className={labelCss}>
@@ -1182,11 +1255,13 @@ const StoreReplenishmentsPage = () => {
                 </label>
                 <input
                   type="text"
+                  maxLength={MAX_LEN.courier}
                   value={courierName}
                   onChange={(e) => setCourierName(e.target.value)}
                   placeholder="Nama kurir / pengantar"
-                  className={inputCss}
+                  className={`${inputCss} ${errCss(shown(shipErrors.courierName))}`}
                 />
+                <FieldError message={shown(shipErrors.courierName)} />
               </div>
             </div>
 
@@ -1214,14 +1289,18 @@ const StoreReplenishmentsPage = () => {
               hint="Pastikan nomor surat jalan terbaca jelas."
             />
 
-            <label className={labelCss}>Catatan (opsional)</label>
-            <textarea
-              value={shipNotes}
-              onChange={(e) => setShipNotes(e.target.value)}
-              placeholder="Catatan pengiriman..."
-              rows={2}
-              className={`${inputCss} mb-4 resize-none`}
-            />
+            <div className="mb-4">
+              <label className={labelCss}>Catatan (opsional)</label>
+              <textarea
+                maxLength={MAX_LEN.note}
+                value={shipNotes}
+                onChange={(e) => setShipNotes(e.target.value)}
+                placeholder="Catatan pengiriman..."
+                rows={2}
+                className={`${inputCss} resize-none ${errCss(shown(shipErrors.notes))}`}
+              />
+              <FieldError message={shown(shipErrors.notes)} />
+            </div>
 
             <div className="flex justify-end gap-2">
               <button onClick={() => setShipTarget(null)} className={btnSecondary}>
@@ -1279,14 +1358,18 @@ const StoreReplenishmentsPage = () => {
               hint="Foto barang yang diterima di toko."
             />
 
-            <label className={labelCss}>Catatan (opsional)</label>
-            <textarea
-              value={receiveNotes}
-              onChange={(e) => setReceiveNotes(e.target.value)}
-              placeholder="Catatan penerimaan..."
-              rows={2}
-              className={`${inputCss} mb-4 resize-none`}
-            />
+            <div className="mb-4">
+              <label className={labelCss}>Catatan (opsional)</label>
+              <textarea
+                maxLength={MAX_LEN.note}
+                value={receiveNotes}
+                onChange={(e) => setReceiveNotes(e.target.value)}
+                placeholder="Catatan penerimaan..."
+                rows={2}
+                className={`${inputCss} resize-none ${errCss(shown(receiveNotesError))}`}
+              />
+              <FieldError message={shown(receiveNotesError)} />
+            </div>
 
             <div className="flex justify-end gap-2">
               <button onClick={() => setReceiveTarget(null)} className={btnSecondary}>
@@ -1303,6 +1386,9 @@ const StoreReplenishmentsPage = () => {
           </div>
         </div>
       )}
+
+      {/* ── MODAL KIRIM VIA WHATSAPP ─────────────────────────── */}
+      {waNotice && <WhatsAppNotifyModal notice={waNotice} onClose={() => setWaNotice(null)} />}
     </div>
   );
 };

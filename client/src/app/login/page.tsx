@@ -8,6 +8,7 @@ import { api } from "@/state/api";
 import { Eye, EyeOff, Lock, User, ExternalLink } from "lucide-react";
 import Image from "next/image";
 import LoginBackground from "./LoginBackground";
+import { MAX_LEN, MAX_PASSWORD } from "@/lib/validation";
 
 // Komponen SetupLink — hanya tampil jika belum ada user di DB
 const SetupLink = () => {
@@ -76,7 +77,7 @@ const LoginPage = () => {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({ username: identifier, password }),
+          body: JSON.stringify({ username: identifier.trim(), password }),
         }
       );
 
@@ -167,9 +168,10 @@ const LoginPage = () => {
                   id="identifier"
                   type="text"
                   autoComplete="username"
+                  maxLength={MAX_LEN.email}
                   value={identifier}
                   onChange={(e) => setIdentifier(e.target.value)}
-                  placeholder="username atau email@contoh.com"
+                  placeholder="username atau nama@gmail.com"
                   className="block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 py-2.5 pl-10 pr-4 text-sm text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:focus:border-blue-400 dark:focus:ring-blue-400"
                 />
               </div>
@@ -191,6 +193,7 @@ const LoginPage = () => {
                   id="password"
                   type={showPassword ? "text" : "password"}
                   autoComplete="current-password"
+                  maxLength={MAX_PASSWORD}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"

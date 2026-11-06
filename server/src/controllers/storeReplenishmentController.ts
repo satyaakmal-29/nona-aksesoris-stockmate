@@ -14,6 +14,14 @@ import {
   nextNumber,
   syncProductAggregates,
 } from "../lib/stockHelpers";
+import {
+  QTY_MAX,
+  formatLimit,
+  isValidQty,
+  optionalText,
+  requiredText,
+  validateDocNumber,
+} from "../lib/validation";
 
 const REF_TYPE = "STORE_REPLENISHMENT";
 
@@ -178,6 +186,7 @@ export const createStoreReplenishment = async (
     if (!Array.isArray(items) || items.length === 0) {
       throw new BusinessError("Item tidak boleh kosong");
     }
+    const cleanNotes = optionalText(notes, "Catatan", 200);
 
     // Validasi item & tentukan harga satuan (default: harga varian / produk)
     const prepared: Array<{
@@ -189,8 +198,8 @@ export const createStoreReplenishment = async (
 
     for (const item of items) {
       if (!item.productId) throw new BusinessError("Setiap item wajib memilih produk");
-      if (!isPositiveInt(item.qtyRequested)) {
-        throw new BusinessError("Jumlah minimal 1 dan harus bilangan bulat");
+      if (!isValidQty(item.qtyRequested)) {
+        throw new BusinessError(`Jumlah harus bilangan bulat 1 – ${formatLimit(QTY_MAX)}`);
       }
 
       const product = await prisma.products.findUnique({
@@ -249,7 +258,7 @@ export const createStoreReplenishment = async (
               srId,
               srNumber,
               createdById: userId,
-              notes: cleanText(notes) || null,
+              notes: cleanNotes,
               Items: {
                 create: prepared.map((p) => ({
                   srItemId: uuidv4(),
@@ -356,6 +365,7 @@ export const approveStoreReplenishment = async (
           approvedById: userId,
           approvedAt: new Date(),
         },
+        include: fullInclude, // item & nama penyetuju dipakai pesan "Kirim via WA"
         omit: LIST_OMIT,
       });
     });
@@ -384,9 +394,7 @@ export const rejectStoreReplenishment = async (
   try {
     const userId = req.session.userId!;
     const { srId } = req.params as { srId: string };
-    const reason = cleanText(req.body?.reason);
-
-    if (!reason) throw new BusinessError("Alasan penolakan wajib diisi");
+    const reason = requiredText(req.body?.reason, "Alasan penolakan", 3, 200);
 
     const order = await prisma.storeReplenishment.findUnique({ where: { srId } });
     if (!order) {
@@ -405,6 +413,7 @@ export const rejectStoreReplenishment = async (
         approvedAt: new Date(),
         rejectedReason: reason,
       },
+      include: fullInclude, // nama penolak dipakai pesan "Kirim via WA"
       omit: LIST_OMIT,
     });
 
@@ -436,12 +445,10 @@ export const shipStoreReplenishment = async (
     const body = req.body ?? {};
 
     // Bukti pengiriman (semua wajib kecuali catatan umum)
-    const deliveryNoteNumber = cleanText(body.deliveryNoteNumber);
-    const courierName = cleanText(body.courierName);
-    if (!deliveryNoteNumber) throw new BusinessError("Nomor surat jalan wajib diisi");
-    if (!courierName) throw new BusinessError("Nama pengantar wajib diisi");
+    const deliveryNoteNumber = validateDocNumber(body.deliveryNoteNumber, "Nomor surat jalan");
+    const courierName = requiredText(body.courierName, "Nama pengantar", 2, 60);
     const deliveryNoteImage = requireImage(body.deliveryNoteImage, "Foto surat jalan");
-    const shipNotes = cleanText(body.shipNotes) || null;
+    const shipNotes = optionalText(body.shipNotes, "Catatan pengiriman", 200);
 
     const shippedItems: Array<{
       srItemId: string;
@@ -483,6 +490,7 @@ export const shipStoreReplenishment = async (
           "Isi alasan untuk item yang dikirim kurang dari jumlah disetujui"
         );
       }
+      if (note.length > 200) throw new BusinessError("Alasan selisih maksimal 200 karakter");
     }
     if (resolved.every((r) => r.qty === 0)) {
       throw new BusinessError("Tidak ada item yang dikirim");
@@ -643,7 +651,7 @@ export const receiveStoreReplenishment = async (
     const body = req.body ?? {};
 
     const receiveImage = requireImage(body.receiveImage, "Foto bukti penerimaan");
-    const receiveNotes = cleanText(body.receiveNotes) || null;
+    const receiveNotes = optionalText(body.receiveNotes, "Catatan penerimaan", 200);
 
     const receivedItems: Array<{
       srItemId: string;
@@ -692,6 +700,7 @@ export const receiveStoreReplenishment = async (
           "Isi alasan untuk item yang diterima kurang dari jumlah dikirim"
         );
       }
+      if (note.length > 200) throw new BusinessError("Alasan selisih maksimal 200 karakter");
     }
 
     const now = new Date();

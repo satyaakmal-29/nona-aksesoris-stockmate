@@ -197,7 +197,7 @@ export const translations = {
     },
     navbar: {
       notifications: "Notifikasi",
-      markAllRead: "Tandai semua dibaca",
+      markAllRead: "Baca semua",
       viewAll: "Lihat semua notifikasi",
       close: "Tutup",
       markRead: "Tandai Dibaca",

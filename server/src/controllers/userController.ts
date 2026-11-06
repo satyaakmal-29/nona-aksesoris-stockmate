@@ -3,11 +3,15 @@ import { prisma } from "../lib/prisma";
 import { v4 as uuidv4 } from "uuid";
 import bcrypt from "bcryptjs";
 import { BusinessError, sendError, cleanText } from "../lib/stockHelpers";
+import {
+  optionalWhatsapp,
+  validateGmail,
+  validatePassword,
+  validatePersonName,
+  validateUsername,
+} from "../lib/validation";
 
 const ROLES = ["super_admin", "admin_toko", "admin_gudang"];
-const MIN_PASSWORD = 6;
-const USERNAME_RE = /^[a-zA-Z0-9._]{3,30}$/;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const listSelect = {
   userId:       true,
@@ -17,6 +21,7 @@ const listSelect = {
   role:         true,
   isActive:     true,
   profileImage: true,
+  whatsapp:     true,
   createdAt:    true,
 } as const;
 
@@ -27,22 +32,11 @@ const profileSelect = {
   email:        true,
   role:         true,
   profileImage: true,
+  whatsapp:     true,
   language:     true,
   notification: true,
   isActive:     true,
 } as const;
-
-const validatePassword = (password: unknown, label = "Password"): string => {
-  if (typeof password !== "string" || password.length < MIN_PASSWORD) {
-    throw new BusinessError(`${label} minimal ${MIN_PASSWORD} karakter`);
-  }
-  return password;
-};
-
-const validateEmail = (email: string): string => {
-  if (!EMAIL_RE.test(email)) throw new BusinessError("Format email tidak valid");
-  return email.toLowerCase();
-};
 
 // Jumlah Super Admin aktif selain user tertentu
 const otherActiveSuperAdmins = (excludeUserId: string) =>
@@ -60,6 +54,30 @@ export const getUsers = async (_req: Request, res: Response): Promise<void> => {
     res.json(users);
   } catch (error) {
     sendError(res, error, "Error retrieving users");
+  }
+};
+
+// ─── GET /users/wa-contacts?roles=a,b — penerima "Kirim via WA" (semua peran) ─
+// Hanya user aktif yang sudah mengisi nomor WhatsApp; akun sendiri tidak ikut.
+export const getWaContacts = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const roles = cleanText(req.query.roles).split(",").map((r) => r.trim()).filter(Boolean);
+    if (roles.length === 0 || roles.some((r) => !ROLES.includes(r))) {
+      throw new BusinessError("Peran penerima tidak valid");
+    }
+    const contacts = await prisma.users.findMany({
+      where:   {
+        role:     { in: roles },
+        isActive: true,
+        whatsapp: { not: null },
+        userId:   { not: req.session.userId! },
+      },
+      select:  { userId: true, name: true, role: true, whatsapp: true },
+      orderBy: [{ role: "asc" }, { name: "asc" }],
+    });
+    res.json(contacts);
+  } catch (error) {
+    sendError(res, error, "Error retrieving WhatsApp contacts");
   }
 };
 
@@ -89,16 +107,18 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const { name, email, profileImage, notification, language } = req.body ?? {};
+    const { name, email, profileImage, notification, language, whatsapp } = req.body ?? {};
     const updateData: Record<string, unknown> = {};
 
     if (name !== undefined) {
-      const clean = cleanText(name);
-      if (!clean) throw new BusinessError("Nama tidak boleh kosong");
-      updateData.name = clean;
+      updateData.name = validatePersonName(name);
+    }
+    // "" = hapus nomor WhatsApp, tidak dikirim = tetap
+    if (whatsapp !== undefined) {
+      updateData.whatsapp = optionalWhatsapp(whatsapp);
     }
     if (email !== undefined) {
-      const clean = validateEmail(cleanText(email));
+      const clean = validateGmail(email);
       const duplicate = await prisma.users.findFirst({
         where: { email: { equals: clean, mode: "insensitive" }, userId: { not: userId } },
       });
@@ -138,15 +158,16 @@ export const changeOwnPassword = async (req: Request, res: Response): Promise<vo
     if (typeof currentPassword !== "string" || !currentPassword) {
       throw new BusinessError("Password lama wajib diisi");
     }
-    const password = validatePassword(newPassword, "Password baru");
-    if (password === currentPassword) {
-      throw new BusinessError("Password baru harus berbeda dari password lama");
-    }
 
     const user = await prisma.users.findUnique({ where: { userId } });
     if (!user) {
       res.status(404).json({ message: "User tidak ditemukan" });
       return;
+    }
+
+    const password = validatePassword(newPassword, user.username, "Password baru");
+    if (password === currentPassword) {
+      throw new BusinessError("Password baru harus berbeda dari password lama");
     }
     if (!(await bcrypt.compare(currentPassword, user.password))) {
       throw new BusinessError("Password lama salah");
@@ -166,18 +187,13 @@ export const changeOwnPassword = async (req: Request, res: Response): Promise<vo
 export const createUser = async (req: Request, res: Response): Promise<void> => {
   try {
     const body = req.body ?? {};
-    const name     = cleanText(body.name);
-    const username = cleanText(body.username);
-    const email    = cleanText(body.email);
-    const role     = cleanText(body.role);
-
-    if (!name || !username || !email || !role) throw new BusinessError("Semua field wajib diisi");
-    if (!USERNAME_RE.test(username)) {
-      throw new BusinessError("Username 3-30 karakter, hanya huruf, angka, titik, atau garis bawah");
-    }
-    const cleanEmail = validateEmail(email);
+    const name       = validatePersonName(body.name);
+    const username   = validateUsername(body.username);
+    const cleanEmail = validateGmail(body.email);
+    const role       = cleanText(body.role);
     if (!ROLES.includes(role)) throw new BusinessError("Role tidak valid");
-    const password = validatePassword(body.password);
+    const password = validatePassword(body.password, username);
+    const whatsapp = optionalWhatsapp(body.whatsapp);
 
     const existing = await prisma.users.findFirst({
       where: {
@@ -201,6 +217,7 @@ export const createUser = async (req: Request, res: Response): Promise<void> => 
         email:    cleanEmail,
         password: await bcrypt.hash(password, 12),
         role,
+        whatsapp,
         language: "Indonesia",
       },
       select: listSelect,
@@ -227,19 +244,16 @@ export const updateUser = async (req: Request, res: Response): Promise<void> => 
     const updateData: Record<string, unknown> = {};
 
     if (body.name !== undefined) {
-      const name = cleanText(body.name);
-      if (!name) throw new BusinessError("Nama tidak boleh kosong");
-      updateData.name = name;
+      updateData.name = validatePersonName(body.name);
     }
     if (body.username !== undefined) {
-      const username = cleanText(body.username);
-      if (!USERNAME_RE.test(username)) {
-        throw new BusinessError("Username 3-30 karakter, hanya huruf, angka, titik, atau garis bawah");
-      }
-      updateData.username = username;
+      updateData.username = validateUsername(body.username);
     }
     if (body.email !== undefined) {
-      updateData.email = validateEmail(cleanText(body.email));
+      updateData.email = validateGmail(body.email);
+    }
+    if (body.whatsapp !== undefined) {
+      updateData.whatsapp = optionalWhatsapp(body.whatsapp);
     }
     if (body.role !== undefined) {
       if (!ROLES.includes(body.role)) throw new BusinessError("Role tidak valid");
@@ -304,13 +318,13 @@ export const updateUser = async (req: Request, res: Response): Promise<void> => 
 export const resetUserPassword = async (req: Request, res: Response): Promise<void> => {
   try {
     const { userId } = req.params as { userId: string };
-    const password = validatePassword(req.body?.newPassword, "Password baru");
 
     const existing = await prisma.users.findUnique({ where: { userId } });
     if (!existing) {
       res.status(404).json({ message: "User tidak ditemukan" });
       return;
     }
+    const password = validatePassword(req.body?.newPassword, existing.username, "Password baru");
 
     await prisma.users.update({
       where: { userId },

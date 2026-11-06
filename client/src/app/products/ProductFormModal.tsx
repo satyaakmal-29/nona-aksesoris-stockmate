@@ -4,8 +4,17 @@ import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import { XIcon, CameraIcon, ImageIcon, PlusIcon, TrashIcon, PencilIcon } from "lucide-react";
 import { useAppSelector } from "@/app/redux";
+import FieldError from "@/app/(components)/FieldError";
 import { getTranslation } from "@/lib/translations";
 import { useCurrency } from "@/lib/useCurrency";
+import {
+  MAX_LEN,
+  optionalTextError,
+  priceError,
+  requiredTextError,
+  squeeze,
+  stockError,
+} from "@/lib/validation";
 import {
   NewProduct,
   Product,
@@ -43,30 +52,35 @@ const emptyDraft = (): VariantDraft => ({
   stockToko:   "0",
 });
 
-// "" dianggap 0. Mengembalikan null jika bukan bilangan bulat >= 0
-const parseStock = (s: string): number | null => {
-  if (s.trim() === "") return 0;
-  const n = Number(s);
-  return Number.isInteger(n) && n >= 0 ? n : null;
-};
+// Kolom stok & harga hanya berisi angka; "" dianggap 0 untuk stok
+const parseStock = (s: string): number => (s.trim() === "" ? 0 : Number(s));
+const parsePrice = (s: string): number => Number(s);
 
-const parsePrice = (s: string): number | null => {
-  if (s.trim() === "") return null;
-  const n = Number(s);
-  return Number.isFinite(n) && n >= 0 ? n : null;
-};
-
+// Error per kolom satu varian. takenNames = nama varian lain di produk yang sama.
 // withStock = false saat mengubah varian lama (stok tidak diubah dari form ini)
-const validateDraft = (d: VariantDraft, withStock: boolean): string | null => {
-  if (!d.name.trim()) return "Nama varian wajib diisi";
-  if (d.price.trim() === "") return "Harga varian wajib diisi";
-  if (parsePrice(d.price) === null) return "Harga varian harus berupa angka 0 atau lebih";
-  if (withStock) {
-    if (parseStock(d.stockGudang) === null) return "Stok gudang varian harus bilangan bulat 0 atau lebih";
-    if (parseStock(d.stockToko)   === null) return "Stok toko varian harus bilangan bulat 0 atau lebih";
+type DraftErrors = Partial<Record<"name" | "value" | "price" | "stockGudang" | "stockToko", string>>;
+
+const draftErrors = (d: VariantDraft, withStock: boolean, takenNames: string[]): DraftErrors => {
+  const errs: DraftErrors = {};
+  const name = squeeze(d.name);
+  if (!name) errs.name = "Nama varian wajib diisi";
+  else if (name.length > MAX_LEN.variantName) errs.name = `Nama varian maksimal ${MAX_LEN.variantName} karakter`;
+  else if (takenNames.some((n) => n.toLowerCase() === name.toLowerCase())) {
+    errs.name = "Nama varian sudah dipakai di produk ini";
   }
-  return null;
+  const sizeError = optionalTextError(d.value, "Ukuran", MAX_LEN.variantSize);
+  if (sizeError) errs.value = sizeError;
+  errs.price = d.price.trim() === "" ? "Harga varian wajib diisi" : priceError(parsePrice(d.price), "Harga varian");
+  if (withStock) {
+    errs.stockGudang = stockError(parseStock(d.stockGudang), "Stok gudang");
+    errs.stockToko   = stockError(parseStock(d.stockToko), "Stok toko");
+  }
+  return errs;
 };
+
+const hasErrors = (e: Record<string, string | undefined>) => Object.values(e).some(Boolean);
+
+const CHECK_FIELDS = "Periksa kembali isian yang ditandai merah.";
 
 const getErrorMessage = (err: unknown): string => {
   const data = (err as { data?: { message?: string } })?.data;
@@ -95,7 +109,8 @@ const PriceInput = ({ value, onChange, className, placeholder }: PriceInputProps
     placeholder={placeholder}
     value={formatDigits(value)}
     onChange={(e) =>
-      onChange(e.target.value.replace(/\D/g, "").replace(/^0+(?=\d)/, ""))
+      // Maks 9 digit (Rp 100.000.000)
+      onChange(e.target.value.replace(/\D/g, "").replace(/^0+(?=\d)/, "").slice(0, 9))
     }
   />
 );
@@ -227,11 +242,14 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
   const [newVariant, setNewVariant] = useState<VariantDraft | null>(null);   // varian baru (mode edit)
   const [editing,    setEditing]    = useState<VariantDraft | null>(null);   // varian lama yang diubah
   const [error,      setError]      = useState<string | null>(null);
+  // Error per kolom tampil setelah tombol simpan ditekan, lalu diperbarui saat mengetik
+  const [showErrors, setShowErrors] = useState(false);
 
   // Isi ulang form setiap modal dibuka atau produk yang diedit berganti
   useEffect(() => {
     if (!isOpen) return;
     setError(null);
+    setShowErrors(false);
     setDrafts([]);
     setNewVariant(null);
     setEditing(null);
@@ -254,20 +272,36 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
     setForm((prev) => ({ ...prev, [name]: value }));
   };
 
+  // ── Error per kolom ──
+  const productErrors = {
+    name:        requiredTextError(form.name, "Nama produk", 3, MAX_LEN.productName),
+    category:    optionalTextError(form.category, "Kategori", MAX_LEN.category),
+    description: optionalTextError(form.description, "Deskripsi", MAX_LEN.description),
+  };
+  // Mode tambah: nama varian dibandingkan dengan varian di atasnya
+  const draftsErrors = drafts.map((d, i) =>
+    draftErrors(d, true, drafts.slice(0, i).map((x) => squeeze(x.name)))
+  );
+  const otherVariantNames = (excludeVariantId?: string) =>
+    (product?.Variants ?? []).filter((v) => v.variantId !== excludeVariantId).map((v) => v.name);
+  const newVariantErrors: DraftErrors = newVariant ? draftErrors(newVariant, true, otherVariantNames()) : {};
+  const editingErrors: DraftErrors = editing ? draftErrors(editing, false, otherVariantNames(editing.key)) : {};
+
   // ── Submit: tambah / edit produk ──
   const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError(null);
+    setShowErrors(true);
 
-    if (!form.name.trim()) { setError("Nama produk wajib diisi"); return; }
+    if (hasErrors(productErrors)) { setError(CHECK_FIELDS); return; }
 
     try {
       if (isEdit && product) {
         await updateProduct({
           productId:   product.productId,
-          name:        form.name.trim(),
-          description: form.description.trim(),
-          category:    form.category.trim(),
+          name:        squeeze(form.name),
+          description: squeeze(form.description),
+          category:    squeeze(form.category),
           imageUrl:    image,
         }).unwrap();
         onClose();
@@ -279,23 +313,20 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
         setError("Produk wajib memiliki minimal 1 varian. Klik \"Tambah varian\" untuk mengisi harga dan stok.");
         return;
       }
-      for (let i = 0; i < drafts.length; i++) {
-        const err = validateDraft(drafts[i], true);
-        if (err) { setError(`Varian ${i + 1}: ${err}`); return; }
-      }
+      if (draftsErrors.some(hasErrors)) { setError(CHECK_FIELDS); return; }
 
       const body: NewProduct = {
-        name:        form.name.trim(),
-        description: form.description.trim() || undefined,
-        category:    form.category.trim()    || undefined,
+        name:        squeeze(form.name),
+        description: squeeze(form.description) || undefined,
+        category:    squeeze(form.category)    || undefined,
         imageUrl:    image,
         variants: drafts.map((d) => ({
-          name:        d.name.trim(),
-          value:       d.value.trim() || undefined,
+          name:        squeeze(d.name),
+          value:       squeeze(d.value) || undefined,
           imageUrl:    d.imageUrl,
-          price:       parsePrice(d.price) ?? 0,
-          stockGudang: parseStock(d.stockGudang) ?? 0,
-          stockToko:   parseStock(d.stockToko)   ?? 0,
+          price:       parsePrice(d.price),
+          stockGudang: parseStock(d.stockGudang),
+          stockToko:   parseStock(d.stockToko),
         })),
       };
 
@@ -310,17 +341,17 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
   const handleAddVariant = async () => {
     if (!product || !newVariant) return;
     setError(null);
-    const err = validateDraft(newVariant, true);
-    if (err) { setError(err); return; }
+    setShowErrors(true);
+    if (hasErrors(newVariantErrors)) { setError(CHECK_FIELDS); return; }
     try {
       await addVariant({
         productId:   product.productId,
-        name:        newVariant.name.trim(),
-        value:       newVariant.value.trim() || undefined,
+        name:        squeeze(newVariant.name),
+        value:       squeeze(newVariant.value) || undefined,
         imageUrl:    newVariant.imageUrl,
-        price:       parsePrice(newVariant.price) ?? 0,
-        stockGudang: parseStock(newVariant.stockGudang) ?? 0,
-        stockToko:   parseStock(newVariant.stockToko)   ?? 0,
+        price:       parsePrice(newVariant.price),
+        stockGudang: parseStock(newVariant.stockGudang),
+        stockToko:   parseStock(newVariant.stockToko),
       }).unwrap();
       setNewVariant(null);
     } catch (e) {
@@ -332,16 +363,16 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
   const handleSaveVariant = async () => {
     if (!product || !editing) return;
     setError(null);
-    const err = validateDraft(editing, false);
-    if (err) { setError(err); return; }
+    setShowErrors(true);
+    if (hasErrors(editingErrors)) { setError(CHECK_FIELDS); return; }
     try {
       await updateVariant({
         productId: product.productId,
         variantId: editing.key,
-        name:      editing.name.trim(),
-        value:     editing.value.trim() || "-",
+        name:      squeeze(editing.name),
+        value:     squeeze(editing.value) || "-",
         imageUrl:  editing.imageUrl,
-        price:     parsePrice(editing.price) ?? 0,
+        price:     parsePrice(editing.price),
       }).unwrap();
       setEditing(null);
     } catch (e) {
@@ -371,15 +402,21 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
   const isSaving = isCreating || isUpdating;
 
   const labelCss = `block text-sm font-medium mb-1 ${isDarkMode ? "text-gray-300" : "text-gray-700"}`;
-  const inputCss = `mb-4 block w-full rounded-lg border-2 p-2.5 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-    isDarkMode
-      ? "border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-400"
-      : "border-gray-300 bg-white text-gray-900 placeholder-gray-400"
+  // Kolom yang error diberi bingkai merah (hanya setelah tombol simpan ditekan)
+  const shown = (msg?: string) => (showErrors ? msg ?? "" : "");
+  const inputCss = (err?: string) => `block w-full rounded-lg border-2 p-2.5 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+    shown(err)
+      ? "border-red-400 bg-white text-gray-900 dark:bg-gray-700 dark:text-gray-100"
+      : isDarkMode
+        ? "border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-400"
+        : "border-gray-300 bg-white text-gray-900 placeholder-gray-400"
   }`;
-  const smallInputCss = `w-full rounded-lg border p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-    isDarkMode
-      ? "border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-400"
-      : "border-gray-300 bg-white text-gray-900 placeholder-gray-400"
+  const smallInputCss = (err?: string) => `w-full rounded-lg border p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+    shown(err)
+      ? "border-red-400 bg-white text-gray-900 dark:bg-gray-700 dark:text-gray-100"
+      : isDarkMode
+        ? "border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-400"
+        : "border-gray-300 bg-white text-gray-900 placeholder-gray-400"
   }`;
   const boxCss = `rounded-xl border p-3 ${
     isDarkMode ? "border-gray-600 bg-gray-700/40" : "border-gray-200 bg-gray-50"
@@ -390,7 +427,8 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
   const renderVariantFields = (
     d: VariantDraft,
     onChange: (next: VariantDraft) => void,
-    withStock: boolean
+    withStock: boolean,
+    errs: DraftErrors
   ) => (
     <div className="flex gap-3">
       <div className="shrink-0">
@@ -407,51 +445,60 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
         <div className="col-span-2">
           <label className={`${mutedCss} text-xs`}>Nama varian *</label>
           <input
-            className={smallInputCss}
+            className={smallInputCss(errs.name)}
             placeholder="contoh: Safa Ather"
+            maxLength={MAX_LEN.variantName}
             value={d.name}
             onChange={(e) => onChange({ ...d, name: e.target.value })}
           />
+          <FieldError message={shown(errs.name)} />
         </div>
         <div>
           <label className={`${mutedCss} text-xs`}>Ukuran (opsional)</label>
           <input
-            className={smallInputCss}
+            className={smallInputCss(errs.value)}
             placeholder="contoh: 30ml"
+            maxLength={MAX_LEN.variantSize}
             value={d.value}
             onChange={(e) => onChange({ ...d, value: e.target.value })}
           />
+          <FieldError message={shown(errs.value)} />
         </div>
         <div>
           <label className={`${mutedCss} text-xs`}>Harga (Rp) *</label>
           <PriceInput
-            className={smallInputCss}
+            className={smallInputCss(errs.price)}
             placeholder="contoh: 50.000"
             value={d.price}
             onChange={(digits) => onChange({ ...d, price: digits })}
           />
+          <FieldError message={shown(errs.price)} />
         </div>
         {withStock && (
           <>
             <div>
               <label className={`${mutedCss} text-xs`}>Stok awal Gudang</label>
               <input
-                type="number"
-                min="0"
-                className={smallInputCss}
+                type="text"
+                inputMode="numeric"
+                maxLength={6}
+                className={smallInputCss(errs.stockGudang)}
                 value={d.stockGudang}
-                onChange={(e) => onChange({ ...d, stockGudang: e.target.value })}
+                onChange={(e) => onChange({ ...d, stockGudang: e.target.value.replace(/\D/g, "") })}
               />
+              <FieldError message={shown(errs.stockGudang)} />
             </div>
             <div>
               <label className={`${mutedCss} text-xs`}>Stok awal Toko</label>
               <input
-                type="number"
-                min="0"
-                className={smallInputCss}
+                type="text"
+                inputMode="numeric"
+                maxLength={6}
+                className={smallInputCss(errs.stockToko)}
                 value={d.stockToko}
-                onChange={(e) => onChange({ ...d, stockToko: e.target.value })}
+                onChange={(e) => onChange({ ...d, stockToko: e.target.value.replace(/\D/g, "") })}
               />
+              <FieldError message={shown(errs.stockToko)} />
             </div>
           </>
         )}
@@ -508,37 +555,53 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
           </div>
 
           {/* Nama */}
-          <label className={labelCss}>{t.labelName}</label>
-          <input
-            type="text"
-            name="name"
-            placeholder={t.placeholderName}
-            value={form.name}
-            onChange={handleChange}
-            className={inputCss}
-          />
+          <div className="mb-4">
+            <label className={labelCss}>{t.labelName}</label>
+            <input
+              type="text"
+              name="name"
+              placeholder={t.placeholderName}
+              maxLength={MAX_LEN.productName}
+              value={form.name}
+              onChange={handleChange}
+              className={inputCss(productErrors.name)}
+            />
+            <FieldError message={shown(productErrors.name)} />
+          </div>
 
           {/* Kategori */}
-          <label className={labelCss}>Kategori</label>
-          <input
-            type="text"
-            name="category"
-            placeholder="contoh: Parfum Wanita"
-            value={form.category}
-            onChange={handleChange}
-            className={inputCss}
-          />
+          <div className="mb-4">
+            <label className={labelCss}>Kategori</label>
+            <input
+              type="text"
+              name="category"
+              placeholder="contoh: Parfum Wanita"
+              maxLength={MAX_LEN.category}
+              value={form.category}
+              onChange={handleChange}
+              className={inputCss(productErrors.category)}
+            />
+            {shown(productErrors.category) ? (
+              <FieldError message={productErrors.category} />
+            ) : (
+              <p className={`mt-1 text-xs ${mutedCss}`}>Penulisan dirapikan otomatis (mis. &quot;kalung&quot; → &quot;Kalung&quot;).</p>
+            )}
+          </div>
 
           {/* Deskripsi */}
-          <label className={labelCss}>Deskripsi</label>
-          <textarea
-            name="description"
-            rows={2}
-            placeholder="Deskripsi singkat produk (opsional)"
-            value={form.description}
-            onChange={handleChange}
-            className={inputCss}
-          />
+          <div className="mb-4">
+            <label className={labelCss}>Deskripsi</label>
+            <textarea
+              name="description"
+              rows={2}
+              placeholder="Deskripsi singkat produk (opsional)"
+              maxLength={MAX_LEN.description}
+              value={form.description}
+              onChange={handleChange}
+              className={inputCss(productErrors.description)}
+            />
+            <FieldError message={shown(productErrors.description)} />
+          </div>
 
           {/* ───────── MODE TAMBAH: varian ───────── */}
           {!isEdit && (
@@ -568,9 +631,10 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
                     {renderVariantFields(
                       d,
                       (next) => setDrafts((prev) => prev.map((x) => (x.key === d.key ? next : x))),
-                      true
+                      true,
+                      draftsErrors[idx]
                     )}
-                    {parsePrice(d.price) !== null && Number(d.price) > 0 && (
+                    {parsePrice(d.price) > 0 && (
                       <p className={`mt-2 text-xs ${mutedCss}`}>
                         Preview harga: <span className="font-semibold">{formatCurrency(Number(d.price))}</span>
                       </p>
@@ -614,7 +678,7 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
                     <div key={v.variantId} className={boxCss}>
                       {isEditingThis && editing ? (
                         <div className="space-y-2">
-                          {renderVariantFields(editing, setEditing, false)}
+                          {renderVariantFields(editing, setEditing, false, editingErrors)}
                           <div className="flex justify-end gap-2">
                             <button
                               type="button"
@@ -712,8 +776,8 @@ const ProductFormModal = ({ isOpen, onClose, product }: ProductFormModalProps) =
               {newVariant ? (
                 <div className={`mt-3 ${boxCss}`}>
                   <p className="mb-2 text-sm font-semibold">Varian baru</p>
-                  {renderVariantFields(newVariant, setNewVariant, true)}
-                  {parsePrice(newVariant.price) !== null && Number(newVariant.price) > 0 && (
+                  {renderVariantFields(newVariant, setNewVariant, true, newVariantErrors)}
+                  {parsePrice(newVariant.price) > 0 && (
                     <p className={`mt-2 text-xs ${mutedCss}`}>
                       Preview harga: <span className="font-semibold">{formatCurrency(Number(newVariant.price))}</span>
                     </p>

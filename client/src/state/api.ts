@@ -41,15 +41,17 @@ export interface User {
   role:        string;
   isActive:    boolean;
   profileImage?: string | null;
+  whatsapp?:   string | null; // format 628…, untuk tombol "Kirim via WA"
   createdAt:   string;
 }
 
 export interface NewUser {
-  name:     string;
-  username: string;
-  email:    string;
-  password: string;
-  role:     string;
+  name:      string;
+  username:  string;
+  email:     string;
+  password:  string;
+  role:      string;
+  whatsapp?: string;
 }
 
 export interface UpdateUser {
@@ -59,6 +61,7 @@ export interface UpdateUser {
   email?:    string;
   role?:     string;
   isActive?: boolean;
+  whatsapp?: string; // "" = hapus
 }
 
 export interface UserProfile {
@@ -68,6 +71,7 @@ export interface UserProfile {
   email:         string;
   role:          string;
   profileImage?: string | null;
+  whatsapp?:     string | null;
   language?:     string | null;
   notification?: boolean | null;
   isActive:      boolean;
@@ -78,8 +82,17 @@ export interface UpdateUserProfile {
   name?:         string;
   email?:        string;
   profileImage?: string;
+  whatsapp?:     string; // "" = hapus
   notification?: boolean;
   language?:     string;
+}
+
+// Penerima tombol "Kirim via WA" (user aktif bernomor WhatsApp, tanpa akun sendiri)
+export interface WaContact {
+  userId:   string;
+  name:     string;
+  role:     string;
+  whatsapp: string;
 }
 
 // ═══════════════════════════════════════
@@ -401,6 +414,16 @@ export interface Transaction {
   // Status pembayaran: QRIS dibuat "pending_payment" sampai kasir mengonfirmasi
   status:            "paid" | "pending_payment" | "cancelled";
   qrisPayload?:      string | null; // QRIS dinamis (nominal terisi)
+  // Transfer: salinan rekening tujuan saat transaksi dibuat (null untuk tunai/QRIS & data lama)
+  transferBankName?:      string | null;
+  transferAccountNumber?: string | null;
+  transferAccountName?:   string | null;
+  // Nota digital lewat email: salinan ke email toko; ke pembeli jika customerEmail diisi
+  customerEmail?:      string | null;
+  receiptEmailStatus?: "sending" | "sent" | "failed" | null;
+  receiptEmailTo?:     string | null; // semua alamat yang sudah berhasil menerima nota
+  receiptEmailError?:  string | null;
+  receiptEmailAt?:     string | null;
   paidAt?:           string | null;
   cancelledAt?:      string | null;
   cancelReason?:     string | null;
@@ -414,6 +437,7 @@ export interface Transaction {
 // paymentAmount wajib untuk tunai; transfer / QRIS selalu dibayar pas.
 export interface NewTransaction {
   customerName?:  string;
+  customerEmail?: string; // opsional: nota digital dikirim ke email pembeli
   paymentMethod:  "cash" | "transfer" | "qris";
   paymentAmount?: number;
   notes?:         string;
@@ -443,6 +467,15 @@ export interface StoreSettings {
   qrisMerchant?:  string | null;
   qrisCity?:      string | null;
   qrisPayload?:   string | null; // hanya dikirim ke Super Admin
+  // Rekening tujuan Transfer (terlihat semua peran)
+  bankConfigured:     boolean;
+  bankName?:          string | null;
+  bankAccountNumber?: string | null;
+  bankAccountName?:   string | null;
+  // Email nota (Gmail toko). App Password tidak pernah dikirim server.
+  emailConfigured:     boolean;
+  storeEmail?:         string | null;
+  emailPasswordSaved?: boolean; // hanya dikirim ke Super Admin
   updatedAt:      string;
 }
 
@@ -450,6 +483,13 @@ export interface UpdateStoreSettings {
   storeName?:    string;
   storeAddress?: string;
   qrisPayload?:  string | null; // null = hapus QRIS
+  // Dikirim bertiga; ketiganya "" = hapus rekening
+  bankName?:          string;
+  bankAccountNumber?: string;
+  bankAccountName?:   string;
+  // "" = hapus email nota; App Password kosong = pakai yang tersimpan (Gmail sama)
+  storeEmail?:      string;
+  smtpAppPassword?: string;
 }
 
 // ═══════════════════════════════════════
@@ -737,6 +777,11 @@ export const api = createApi({
     changeOwnPassword: build.mutation<{ message: string }, { currentPassword: string; newPassword: string }>({
       query: (body) => ({ url: "/users/profile/password", method: "PATCH", body }),
     }),
+    // roles dipisah koma, mis. "admin_toko,super_admin"
+    getWaContacts: build.query<WaContact[], string>({
+      query: (roles) => ({ url: "/users/wa-contacts", params: { roles } }),
+      providesTags: ["Users"],
+    }),
 
     // ── PRODUCTS ────────────────────────────────────────────────
     getProducts: build.query<Product[], string | void>({
@@ -885,6 +930,13 @@ export const api = createApi({
       }),
       invalidatesTags: ["Transactions", "DashboardMetrics"],
     }),
+    // Kirim (ulang) nota digital; email = email pembeli ("" = kirim ke email toko saja)
+    emailTransactionReceipt: build.mutation<Transaction, { transactionId: string; email?: string }>({
+      query: ({ transactionId, email }) => ({
+        url: `/transactions/${transactionId}/email-receipt`, method: "POST", body: { email },
+      }),
+      invalidatesTags: ["Transactions"],
+    }),
     createTransaction: build.mutation<Transaction, NewTransaction>({
       query: (body) => ({ url: "/transactions", method: "POST", body }),
       invalidatesTags: [
@@ -925,14 +977,45 @@ export const api = createApi({
       query:       () => "/notifications",
       providesTags: ["Notifications"],
     }),
+    // Badge & daftar langsung diperbarui (optimistic) tanpa menunggu server;
+    // dikembalikan jika request gagal. invalidatesTags tetap menyinkronkan ulang.
     markNotificationAsRead: build.mutation<Notification, string>({
       query: (notifId) => ({
         url: `/notifications/${notifId}`, method: "PATCH",
       }),
+      async onQueryStarted(notifId, { dispatch, queryFulfilled }) {
+        const patch = dispatch(
+          api.util.updateQueryData("getNotifications", undefined, (draft) => {
+            const notif = draft.notifications.find((n) => n.notifId === notifId);
+            if (notif && !notif.isRead) {
+              notif.isRead = true;
+              draft.unreadCount = Math.max(0, draft.unreadCount - 1);
+            }
+          })
+        );
+        try {
+          await queryFulfilled;
+        } catch {
+          patch.undo();
+        }
+      },
       invalidatesTags: ["Notifications"],
     }),
     markAllNotificationsAsRead: build.mutation<{ message: string }, void>({
       query: () => ({ url: "/notifications/read-all", method: "PATCH" }),
+      async onQueryStarted(_arg, { dispatch, queryFulfilled }) {
+        const patch = dispatch(
+          api.util.updateQueryData("getNotifications", undefined, (draft) => {
+            draft.notifications.forEach((n) => { n.isRead = true; });
+            draft.unreadCount = 0;
+          })
+        );
+        try {
+          await queryFulfilled;
+        } catch {
+          patch.undo();
+        }
+      },
       invalidatesTags: ["Notifications"],
     }),
 
@@ -966,6 +1049,9 @@ export const api = createApi({
     updateStoreSettings: build.mutation<StoreSettings, UpdateStoreSettings>({
       query: (body) => ({ url: "/settings/store", method: "PUT", body }),
       invalidatesTags: ["StoreSettings"],
+    }),
+    sendTestEmail: build.mutation<{ message: string }, void>({
+      query: () => ({ url: "/settings/store/test-email", method: "POST" }),
     }),
 
     // ── EXPENSES (Super Admin) ──────────────────────────────────
@@ -1006,6 +1092,7 @@ export const {
   useGetProfileQuery,
   useUpdateUserProfileMutation,
   useChangeOwnPasswordMutation,
+  useGetWaContactsQuery,
   // Products
   useGetProductsQuery,
   useCreateProductMutation,
@@ -1034,6 +1121,7 @@ export const {
   useCreateTransactionMutation,
   useConfirmTransactionPaymentMutation,
   useCancelTransactionMutation,
+  useEmailTransactionReceiptMutation,
   // Inventory
   useGetStockGudangQuery,
   useGetStockTokoQuery,
@@ -1050,6 +1138,7 @@ export const {
   // Pengaturan toko
   useGetStoreSettingsQuery,
   useUpdateStoreSettingsMutation,
+  useSendTestEmailMutation,
   // Expenses
   useGetExpensesQuery,
   useGetExpenseByIdQuery,

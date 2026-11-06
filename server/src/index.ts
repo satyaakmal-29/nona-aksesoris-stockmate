@@ -19,6 +19,7 @@ import notificationRoutes       from "./routes/notificationRoutes";
 import inventoryRoutes          from "./routes/inventoryRoutes";
 import reportRoutes             from "./routes/reportRoutes";
 import storeSettingsRoutes      from "./routes/storeSettingsRoutes";      // QRIS & identitas toko
+import { resetInterruptedReceiptEmails } from "./controllers/transactionController";
 
 dotenv.config();
 const app = express();
@@ -49,7 +50,8 @@ app.use(
     cookie: {
       httpOnly: true,
       secure:   process.env.NODE_ENV === "production",
-      maxAge:   7 * 24 * 60 * 60 * 1000,
+      // Sesi berakhir 18 jam setelah login (tidak diperpanjang otomatis; rolling = false)
+      maxAge:   18 * 60 * 60 * 1000,
       sameSite: "lax",
     },
   })
@@ -87,6 +89,9 @@ app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
 });
 
 const port = Number(process.env.PORT) || 8000;
-app.listen(port, "0.0.0.0", () => {
+// Tanpa host: Node mendengarkan IPv6 + IPv4 sekaligus (termasuk LAN). Jika hanya
+// "0.0.0.0", "localhost" di Windows dicoba lewat ::1 dulu → tiap koneksi baru +±200 ms.
+app.listen(port, () => {
   console.log(`Server running on port ${port}`);
+  void resetInterruptedReceiptEmails();
 });
